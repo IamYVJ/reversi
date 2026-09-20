@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0A0B12" />
+  <meta name="description" content="Reversi — the disc-flipping classic, played in your browser. Two on one screen, against a bot, or peer-to-peer with a friend. No server, no accounts." />
+  <title>Reversi — Flip the Board</title>
+
+  <!-- PWA manifest (relative path for GitHub Pages subpaths). -->
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="./icons/icon.svg" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+
+  <!-- Fonts. Preconnect + Google Fonts; the service worker caches the served
+       font files so the offline shell still renders correctly. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,500;0,700;1,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="./css/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-root"></div>
+
+  <!-- Fine print. Deliberately OUTSIDE #app, for the same reason as #announce
+       below: draw() in js/main.js opens with clear(root), which strips every
+       child of #app on every single draw. A footer inside it would survive
+       exactly one frame, then vanish the next time anyone took a turn. -->
+  <footer class="site-foot">
+    <p class="visitor-counter" hidden>
+      <span id="visitor-count" class="visitor-count">—</span> visitors
+    </p>
+    <button type="button" id="clear-cache" class="cache-reset">Clear cache &amp; reload</button>
+  </footer>
+
+  <!-- Screen-reader announcements. Deliberately OUTSIDE #app: a live region
+       only fires when text changes inside a node that was already in the
+       document, and #app is emptied and rebuilt on every render. -->
+  <div id="announce" class="sr-only" role="status" aria-live="polite"></div>
+  <noscript>This game requires JavaScript to run.</noscript>
+
+  <!-- PeerJS, for the peer-to-peer mode only.
+
+       A plain script tag from a PINNED version on a CDN, deliberately not an
+       npm dependency: package.json in this project has no `dependencies` key
+       at all and there is no build step to bundle one. js/net.js reads it off
+       window.Peer and throws a readable error if it is missing, which is what
+       an offline first load or a blocked CDN looks like.
+
+       Loaded before main.js but NOT deferred behind it. The service worker
+       caches it best-effort (EXTERNAL in sw.js, never SHELL) so a failed CDN
+       cannot break the install: hotseat and bot mode must still work with this
+       file unavailable, which is why net.js is the only module that touches
+       it and why it reads window.Peer lazily rather than at import time. -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+  <script type="module" src="./js/main.js"></script>
+
+  <!-- Analytics beacon. Shared GoatCounter site across projects on purpose:
+       counts are per-path, so this repo separates itself via its own pathname.
+       Must NOT be precached and must NOT be routed by the service worker — a
+       beacon answered from cache would record nothing. -->
+  <script
+    data-goatcounter="https://yvj.goatcounter.com/count"
+    async
+    src="//gc.zgo.at/count.js">
+  </script>
+
+  <!-- Footer behaviour. A classic inline script, NOT a module, and
+       deliberately not part of js/main.js's import graph.
+
+       The reason is the reset button. The failure it exists to rescue is a
+       half-applied service worker cache serving a new main.js against a cache
+       missing one of its imports, which boots to a blank screen. If the escape
+       hatch shipped inside that same import graph it would be dead in
+       precisely the situation it is for. Kept here, it still works when
+       nothing else on the page does. -->
+  <script>
+  (function () {
+    // --- Visitor counter ---------------------------------------------------
+    function showVisitorCount() {
+      const box = document.querySelector('.visitor-counter');
+      const out = document.getElementById('visitor-count');
+      if (!box || !out) return;
+
+      // Derive the host from the beacon tag so the site lives in exactly one place.
+      const tag = document.querySelector('script[data-goatcounter]');
+      const endpoint = tag && tag.dataset.goatcounter;
+      if (!endpoint) return;
+
+      // Per-path, NOT /counter/TOTAL.json — TOTAL sums every page on the
+      // GoatCounter site and would report the other projects' traffic as if it
+      // were this one's.
+      //
+      // Read live rather than pinned to a constant, because this app has no
+      // client-side path routing: no pushState, no hash routing, and no other
+      // read of location.pathname anywhere in js/. Screens are swapped by
+      // re-rendering #app from app.screen, so the path never moves under us.
+      //
+      // pathname only, deliberately WITHOUT location.search. index.html carries
+      // no <link rel="canonical">, so count.js files the view under
+      // pathname + search; a visitor arriving with ?fbclid=… is recorded under
+      // that longer path but is still shown the aggregate for the clean path.
+      const path = window.location.pathname;
+
+      // ?start= is a documented parameter (all-time is the default, so this
+      // does not change WHAT is counted) that is ALSO part of the response's
+      // cache key. Pinned for one reason: a path with no data yet answers 404,
+      // and GoatCounter caches that 404 for up to four hours — so the bare URL
+      // can sit on "no data" for hours AFTER the first real visit lands.
+      //
+      // A FIXED date predating this project's first pageview. Never a relative
+      // period like `week` or `year` — those are rolling windows that would
+      // silently stop being an all-time count.
+      const START = '2026-01-01';
+
+      fetch(`${endpoint.replace(/\/count$/, '')}/counter/${encodeURIComponent(path)}.json?start=${START}`)
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error('bad status'))))
+        .then((data) => {
+          // `count` arrives pre-formatted with thousands separators ("1,234").
+          if (data && data.count != null) {
+            out.textContent = String(data.count);
+            box.hidden = false;
+          }
+        })
+        .catch(() => { /* purely decorative: stay hidden on every failure */ });
+    }
+
+    // --- Clear cache & reload ----------------------------------------------
+    function wireCacheReset() {
+      const btn = document.getElementById('clear-cache');
+      if (!btn) return;
+
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = 'Clearing…';
+
+        try {
+          // Cache Storage ONLY. This must never touch localStorage, which in
+          // this app holds two things that cannot be rebuilt:
+          //
+          //   reversi.clientId — the random 128-bit value this browser is
+          //     known by. It is the ONLY thing a seat in a live game is bound
+          //     to, and nothing re-issues it: a fresh id is simply a different
+          //     device, so the host refuses the reclaim and the player is
+          //     locked out of their own colour for the rest of the game.
+          //
+          //   reversi.engine — the host's snapshot of authoritative game
+          //     state. In peer-to-peer the host's device holds the only copy
+          //     that exists, so clearing it there ends the game for both
+          //     players, not just whoever pressed the button.
+          //
+          // (reversi.session, .name and .lastCode also live there. Those are
+          // conveniences — losing them costs an auto-rejoin, nothing more.)
+          if (window.caches) {
+            const keys = await caches.keys();
+            await Promise.all(keys.map((k) => caches.delete(k)));
+          }
+          // Drop the controlling worker too, so the reload comes off the
+          // network rather than from a worker still holding in-memory state.
+          // main.js re-registers a clean one on the way back up.
+          if (navigator.serviceWorker) {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map((r) => r.unregister()));
+          }
+        } catch (_) {
+          // A partial clear is still worth reloading after — fall through
+          // rather than leaving the button stuck on "Clearing…".
+        }
+
+        // Plain reload, NO cache-busting query string: count.js files
+        // pageviews under pathname + search, so a ?v=… would log every reset
+        // as a brand new page and pollute the stats.
+        window.location.reload();
+      });
+    }
+
+    showVisitorCount();
+    wireCacheReset();
+  })();
+  </script>
+</body>
+</html>
