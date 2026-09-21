@@ -45,8 +45,18 @@ export function render(root, app, intents) {
 function homeScreen(app, intents) {
   return el('div', { class: 'shell shell-home', 'data-announce': 'Reversi. Choose how to play.' },
     el('header', { class: 'masthead' },
-      el('h1', { class: 'wordmark' }, 'Reversi'),
+      // Split only so the two Rs can take the accent. Inline spans do not
+      // affect the heading's accessible name — it still computes to
+      // "Reversi" — so no aria override is needed, and adding one would
+      // just be a second copy of the word to keep in sync.
+      el('h1', { class: 'wordmark' },
+        el('span', { class: 'wordmark-accent' }, 'R'), 'eve',
+        el('span', { class: 'wordmark-accent' }, 'r'), 'si'),
       el('p', { class: 'tagline' }, 'Flank a line of discs, turn them over, hold the corners.'),
+      // Purely decorative: one black disc and one white on a hairline, which
+      // is the opening position in miniature. Hidden from the accessibility
+      // tree — the tagline above already says what this says.
+      el('div', { class: 'masthead-rule', 'aria-hidden': 'true' }),
     ),
     el('div', { class: 'mode-list' },
       modeCard({

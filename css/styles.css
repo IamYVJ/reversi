@@ -39,6 +39,14 @@
   --disc-black: #14161D;
   --disc-white: #F2F0E7;
 
+  /* Depth. Derived, not new colour: every one of these is either black at low
+     alpha or the accent already declared above. The palette is still one
+     accent — these only give the surfaces somewhere to sit. */
+  --accent-soft: rgba(124, 140, 255, 0.05);
+  --plate:       rgba(0, 0, 0, 0.26);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.30), 0 8px 22px rgba(0, 0, 0, 0.26);
+  --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.34), 0 16px 38px rgba(0, 0, 0, 0.42);
+
   /* Shared across every game in this family. Do not change. */
   --radius: 14px;
   --maxw:   640px;
@@ -91,22 +99,71 @@ body {
 
 /* --- Type ----------------------------------------------------------------- */
 
-.masthead { text-align: center; padding: 22px 0 4px; }
+.masthead { text-align: center; padding: 30px 0 6px; }
 
 .wordmark {
   font-family: var(--serif);
   font-weight: 700;
-  font-size: clamp(38px, 11vw, 60px);
+  font-size: clamp(42px, 12vw, 66px);
   line-height: 1;
   margin: 0;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
+  color: var(--text);
 }
 
+/* The two Rs carry the accent; the rest of the word stays --text.
+
+   Deliberately a plain `color` on real inline spans, not the clipped
+   background-image this was before. That mechanism needs `color: transparent`,
+   so anywhere background-clip goes unhonoured the wordmark is not merely
+   unstyled but INVISIBLE, and it needs an @supports guard to be safe at all.
+   Colouring a glyph needs no guard and cannot fail open.
+
+   6.6:1 on --bg, so the accent letters are no harder to read than the ones
+   around them. This is the one place in the app where the accent carries text
+   rather than decorating it, which is why that number is worth stating. */
+.wordmark-accent { color: var(--accent); }
+
 .tagline {
-  margin: 12px 0 0;
+  margin: 14px auto 0;
+  max-width: 34ch;
   color: var(--muted);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.55;
+}
+
+/* The opening position, shrunk to a dingbat: one black disc and one white,
+   sitting on a hairline. Decorative, and the cheapest way to say what game
+   this is before the board has been drawn even once. */
+.masthead-rule {
+  width: 132px;
+  height: 12px;
+  margin: 20px auto 0;
+  position: relative;
+  background: linear-gradient(90deg,
+    transparent, var(--border-soft) 22%, var(--border-soft) 78%, transparent);
+  background-size: 100% 1px;
+  background-repeat: no-repeat;
+  background-position: 0 50%;
+}
+.masthead-rule::before,
+.masthead-rule::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  transform: translateY(-50%);
+}
+.masthead-rule::before {
+  left: calc(50% - 12px);
+  background: var(--disc-black);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.26);
+}
+.masthead-rule::after {
+  left: calc(50% + 1px);
+  background: var(--disc-white);
 }
 
 .panel-title, .mode-title {
@@ -119,9 +176,27 @@ body {
   margin: 0 0 12px;
 }
 
+/* A small accent pip in front of every section heading. The lobby is five
+   stacked panels of near-identical weight; without a repeating marker the eye
+   has nothing to count down the page by. */
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.panel-title::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.6;
+  flex: none;
+}
+
 .mode-title {
   font-family: var(--serif);
-  font-size: 19px;
+  font-size: 20px;
   letter-spacing: 0;
   text-transform: none;
   color: var(--text);
@@ -186,23 +261,56 @@ body {
 
 /* --- Home ----------------------------------------------------------------- */
 
-.mode-list { display: flex; flex-direction: column; gap: 12px; }
+.mode-list { display: flex; flex-direction: column; gap: 14px; }
 
 .mode-card {
-  background: var(--surface);
+  /* A gradient, not a flat fill. --surface on --bg is a four-point lightness
+     step; lit from the top it reads as a raised card instead of a rectangle
+     that happens to be slightly paler than the page. */
+  background: linear-gradient(180deg, var(--surface-2), var(--surface) 78%);
   border: 2px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 18px;
+  padding: 20px;
   display: flex;
   flex-direction: column;
   gap: 4px;
   align-items: flex-start;
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--shadow-1);
+  transition: border-color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
 }
 
-.mode-card .btn { margin-top: 12px; }
+/* An accent rail down the leading edge, revealed on hover. focus-within is
+   what makes it work for the keyboard too — and it is why the p2p card lights
+   up while the code is being typed into it. */
+.mode-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+.mode-card:hover,
+.mode-card:focus-within {
+  border-color: var(--border);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-2);
+}
+.mode-card:hover::before,
+.mode-card:focus-within::before { opacity: 1; }
+
+/* Full width, so three cards present three identical doors. The modes are
+   deliberately not ranked, and a row of buttons each hugging its own label
+   ranks them by accident — the eye reads the widest as the main one. */
+.mode-card .btn { margin-top: 14px; width: 100%; }
 .mode-card.is-soon { opacity: 0.55; }
 
-.mode-blurb { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.mode-blurb { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
 
 /* --- Room codes ----------------------------------------------------------- */
 
@@ -211,9 +319,15 @@ body {
   gap: 8px;
   align-items: stretch;
   width: 100%;
-  margin-top: 10px;
+  margin-top: 12px;
+  /* Separates the second door from the first. Without it "Host a game" and
+     the join box read as one four-element stack rather than two choices. */
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
 }
-.join-row .btn { margin-top: 0; }
+/* Overrides `.mode-card .btn`, which is full-width by design. In here the
+   button shares a row with the code box and must hug its label instead. */
+.join-row .btn { margin-top: 0; width: auto; flex: 1 1 auto; }
 
 .code-input {
   /* Four wide-tracked characters and no more, so the box is visibly sized for
@@ -234,22 +348,38 @@ body {
   text-align: center;
   text-transform: uppercase;
   padding: 10px 8px;
+  background-color: var(--plate);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
-.code-input:focus { border-color: var(--accent); outline: none; }
+.code-input:focus {
+  border-color: var(--accent);
+  background-color: var(--accent-dim);
+  outline: none;
+}
 .code-input::placeholder { color: var(--muted); opacity: 0.5; letter-spacing: 0.2em; }
 
-.code-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.code-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 
 .room-code {
   font-family: var(--mono);
-  font-size: 30px;
+  font-size: 32px;
   font-weight: 700;
   letter-spacing: 0.28em;
-  text-indent: 0.28em;
   color: var(--accent);
   /* Selectable on purpose: the Copy button covers the common case, but a
      clipboard write needs a secure context and this is the fallback. */
   user-select: all;
+  /* On its own plate. This is the one string in the app a player has to read
+     out loud to another human, so it gets to look like the label on a door
+     rather than a heading. The right padding absorbs the trailing letter-space
+     that tracking adds after the final character, which is what would
+     otherwise push the text visibly left of centre. */
+  flex: 1 1 auto;
+  text-align: center;
+  padding: 10px 12px 10px calc(12px + 0.28em);
+  border-radius: 10px;
+  background: var(--plate);
+  border: 1px solid var(--border);
 }
 
 .net-line {
@@ -293,29 +423,63 @@ body {
 .notice .link-btn { color: var(--warn); }
 
 .panel {
-  background: var(--surface);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface) 78%);
   border: 2px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 16px 18px;
+  padding: 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+  box-shadow: var(--shadow-1);
+}
+
+/* The room code is the reason the lobby exists before an opponent arrives, so
+   it is the one panel allowed to carry the accent as a surface rather than as
+   a detail. Everything below it stays neutral and recedes. */
+.panel-room {
+  background: linear-gradient(180deg, var(--accent-dim), var(--accent-soft));
+  border-color: var(--border);
 }
 
 .rules-summary {
   margin: 0;
   font-family: var(--mono);
   font-size: 11px;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   color: var(--muted);
   text-align: center;
+  /* Hairlines either side rather than a box: this is a caption on the rules
+     above, not another section. */
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.rules-summary::before,
+.rules-summary::after {
+  content: '';
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--border-soft);
 }
 
 /* --- Lobby controls ------------------------------------------------------- */
 
-.seat-list { display: flex; flex-direction: column; gap: 10px; }
+.seat-list { display: flex; flex-direction: column; gap: 8px; }
 
-.seat { display: flex; align-items: center; gap: 10px; }
+/* Each seat sits on its own faint slab, so two players read as two rows of a
+   table rather than as two lines of text that happen to have a dot in front. */
+.seat {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.022);
+  border: 1px solid var(--border-soft);
+}
+/* The seat nobody is in yet: dashed, to match the hollow disc already in it. */
+.seat-empty { background: none; border-style: dashed; }
 
 .seat-empty .seat-name, .seat.is-away .seat-colour { color: var(--muted); font-style: italic; }
 /* An unclaimed seat still shows which colour is waiting, hollow rather than
@@ -354,24 +518,52 @@ body {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
-  padding: 8px 14px;
+  padding: 9px 16px;
   border-radius: 999px;
   border: 2px solid var(--border-soft);
-  background: transparent;
+  background: var(--plate);
   color: var(--muted);
   cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
 }
-.chip.is-on { border-color: var(--accent); background: var(--accent-dim); color: var(--text); }
+.chip:not(:disabled):hover { border-color: var(--border); color: var(--text); }
+.chip.is-on {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--text);
+}
 .chip:disabled { cursor: default; opacity: 0.5; }
 
-.chip-hint { font-size: 12px; color: var(--muted); }
+.chip-hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
 
+/* The single action the whole lobby leads to, so it is allowed to be heavier
+   than any other control on the screen. Direct child of the shell — the only
+   button that sits outside a panel. */
+.shell-lobby > .btn-primary {
+  padding: 16px 18px;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  box-shadow: 0 8px 26px rgba(124, 140, 255, 0.20);
+}
+.shell-lobby > .btn-primary:disabled { box-shadow: none; }
+
+/* A row, not a floating checkbox. Padding it out gives the whole strip a hit
+   area and somewhere for a hover state to land, which is most of what makes a
+   list of options feel built rather than dumped on the page. */
 .toggle {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 11px;
   cursor: pointer;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
+.toggle:hover { background: var(--accent-soft); border-color: var(--border-soft); }
+/* :has() carries the on-state to the whole row. Where it is unsupported the
+   row simply stays neutral and the checkbox still says everything. */
+.toggle:has(input:checked) { background: var(--accent-dim); border-color: var(--border); }
 .toggle input { margin-top: 3px; accent-color: var(--accent); width: 16px; height: 16px; }
 .toggle-text { display: flex; flex-direction: column; gap: 2px; }
 .toggle-label { font-size: 14px; }
@@ -703,4 +895,11 @@ body {
      times a second and flickers, which is the opposite of what was asked for.
      Every looping animation has to be turned off by name. */
   .ellipsis { animation: none !important; opacity: 1; }
+
+  /* Collapsing the transition only makes the lift instant, and an instant
+     2px jump under the pointer is still the movement that was opted out of.
+     The card keeps its border and shadow response, which carry the same
+     information without anything having to move. */
+  .mode-card:hover,
+  .mode-card:focus-within { transform: none; }
 }
