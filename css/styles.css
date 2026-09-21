@@ -482,12 +482,34 @@ body {
   width: 100%;
   max-width: 520px;
   touch-action: manipulation;
+  /* Containing block for .felt, which is positioned rather than placed. Not
+     cosmetic — without it the felt escapes to the viewport. */
+  position: relative;
 }
 
-/* Explicitly spans only the playing area, leaving the gutter outside it. */
+/* The felt spans only the playing area, leaving the coordinate gutter outside
+   it. Every cell is AUTO-PLACED, and this is the one element that is not.
+
+   `position: absolute` is load-bearing, not a paint trick. A grid item that
+   spans the whole playing area MARKS THOSE CELLS OCCUPIED, and grid
+   auto-placement never overlaps an occupied cell — so as a normal grid item
+   the felt pushes every square it covers out of the grid entirely, and they
+   cascade down the gutter column into implicit rows. The symptom is the top
+   row of the board vanishing behind a bare green slab.
+
+   An absolutely positioned child of a grid container is NOT a grid item: it
+   still resolves grid-column/grid-row to get its containing block, but it
+   occupies nothing and the squares place normally underneath it. Keeping the
+   `2 / -1` placement rather than hardcoding offsets means the felt still
+   tracks the board's real geometry at any size.
+
+   `inset: 0` is required. With auto offsets an out-of-flow box is sized
+   shrink-to-fit, and this one is empty — it would come out 0x0. */
 .felt {
+  position: absolute;
   grid-column: 2 / -1;
   grid-row: 2 / -1;
+  inset: 0;
   z-index: 0;
   border-radius: 6px;
   background: linear-gradient(160deg, var(--felt), var(--felt-2));

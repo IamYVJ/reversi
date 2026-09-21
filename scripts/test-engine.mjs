@@ -1538,6 +1538,44 @@ section('packaging: the page, the manifest and the worker agree');
   ok(!shell.has(`https://${pinned[0]}`), 'but PeerJS is not in SHELL');
 }
 
+section('packaging: the felt does not evict the squares it sits behind');
+{
+  // A layout regression that no amount of DOM testing catches, because the DOM
+  // is correct and only the geometry is wrong — which is exactly why it is
+  // pinned here in text rather than left to be noticed by eye.
+  //
+  // .felt spans the whole playing area. As a normal grid item that marks every
+  // one of those cells OCCUPIED, and auto-placement refuses to overlap an
+  // occupied cell, so all 64 squares get evicted into implicit rows down the
+  // gutter column and the board collapses. Absolute positioning is what stops
+  // it being a grid item at all; it still reads grid-column/grid-row to find
+  // its containing block, but it no longer consumes anything.
+  const css = readFileSync(new URL('../css/styles.css', import.meta.url), 'utf8');
+  const ruleFor = (sel) => {
+    const at = css.indexOf(`\n${sel} {`);
+    return at === -1 ? '' : css.slice(at, css.indexOf('}', at));
+  };
+
+  const felt = ruleFor('.felt');
+  ok(!!felt, '.felt has a rule');
+  ok(/position:\s*absolute/.test(felt), '.felt is positioned, not placed');
+  // Out-of-flow and empty means shrink-to-fit means zero. It needs stretching
+  // to the grid area it resolved.
+  ok(/inset:\s*0/.test(felt), '.felt is stretched to the area it resolved');
+  ok(/grid-column:\s*2\s*\/\s*-1/.test(felt), '.felt still spans the playing columns');
+  ok(/grid-row:\s*2\s*\/\s*-1/.test(felt), '.felt still spans the playing rows');
+
+  // The pairing. Without this the felt resolves against the viewport and the
+  // board loses its surface entirely.
+  ok(/position:\s*relative/.test(ruleFor('.board')),
+    '.board is the containing block for it');
+
+  // The squares must stay auto-placed — the fix works precisely because
+  // nothing else in the board competes for explicit territory.
+  ok(!/grid-(area|column|row)/.test(ruleFor('.cell')),
+    '.cell claims no grid position of its own');
+}
+
 // --- Result ----------------------------------------------------------------
 
 console.log(`\n${passed} passed, ${failed} failed`);
