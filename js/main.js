@@ -158,33 +158,58 @@ function setNet(status) {
   draw();
 }
 
+// Reclaiming a room code after a reload races the broker, which can still be
+// holding the old socket open and answers 'unavailable-id'. How long it holds
+// on is not ours to know, so a single retry is a coin flip: a bounded backoff
+// gives a mid-game reload several chances to resume instead of telling the
+// host to go and start a new game. It is bounded because if the code is
+// genuinely taken by someone else the answer never changes, and the UI must
+// not sit on "Opening the room…" forever; when the delays run out the host
+// gets NET.LOST and the notice instead.
+const RECLAIM_DELAYS_MS = [2000, 4000, 8000, 8000];
+let reclaimAttempts = 0;
+
+// A resumed room is the only case where 'unavailable-id' means "our own stale
+// socket". For a fresh room it means the random code collided with somebody
+// else's on the shared broker, and waiting will not change that — so a fresh
+// room gets one new code instead of the backoff.
+let hostResumed = false;
+let codeRerolled = false;
+
 function dropLink() {
   if (link) { link.destroy(); link = null; }
   guestIds.clear();
-  idRetried = false;
+  reclaimAttempts = 0;
+  hostResumed = false;
+  codeRerolled = false;
   app.net = '';
 }
 
-// Reclaiming a room code after a reload races the broker, which can still be
-// holding the old socket open for a second or two and answers 'unavailable-id'
-// — fatal only if you ask exactly once. One retry on a generous delay is the
-// difference between a mid-game reload resuming and the host being told to go
-// and start a new game. The flag makes it one retry, not a loop: if the code
-// is genuinely taken by someone else, the second answer is the real one.
-const ID_RETRY_MS = 2000;
-let idRetried = false;
-
 function reclaimCode() {
   const code = app.code;
+  const delay = RECLAIM_DELAYS_MS[reclaimAttempts++];
   if (link) { link.destroy(); link = null; }
   app.net = NET.OPENING;
   setTimeout(() => {
-    // The player may well have gone home in those two seconds.
+    // The player may well have gone home while we waited.
     if (app.mode !== 'p2p' || !app.me.isHost || app.code !== code) return;
     if (!openLink(() => createHost(code, hostHandlers()))) return;
     hostSync();
-  }, ID_RETRY_MS);
+  }, delay);
   draw();
+}
+
+// A freshly generated code collided with another live room. Pick another and
+// open again, once; after that the broker is telling us something real.
+function rerollCode() {
+  codeRerolled = true;
+  if (link) { link.destroy(); link = null; }
+  const code = generateRoomCode();
+  app.code = code;
+  app.net = NET.OPENING;
+  if (!openLink(() => createHost(code, hostHandlers()))) return;
+  saveLastCode(code);
+  hostSync();
 }
 
 // --- Hosting ---------------------------------------------------------------
@@ -214,6 +239,9 @@ function startP2P() {
   app.me.isHost = !serverConfigured();
   app.notice = '';
   app.net = NET.OPENING;
+  hostResumed = false;
+  codeRerolled = false;
+  reclaimAttempts = 0;
 
   if (!openLink(() => createHost(code, hostHandlers()))) return;
   saveLastCode(code);
@@ -222,7 +250,10 @@ function startP2P() {
 
 function hostHandlers() {
   return {
-    onOpen: () => setNet(guestIds.size ? NET.LIVE : NET.WAITING),
+    onOpen: () => {
+      reclaimAttempts = 0;
+      setNet(guestIds.size ? NET.LIVE : NET.WAITING);
+    },
     // Nothing happens on a bare connection. A channel that has not said hello
     // has no identity, so it cannot be seated and cannot act.
     onConnect: () => {},
@@ -241,10 +272,19 @@ function hostHandlers() {
     onBrokerUp: () => setNet(guestIds.size ? NET.LIVE : NET.WAITING),
     onBrokerLost: () => setNet(NET.LOST),
     onError: (err) => {
-      if (err && err.type === 'unavailable-id' && !idRetried && app.code) {
-        idRetried = true;
-        reclaimCode();
-        return;
+      if (err && err.type === 'unavailable-id' && app.code) {
+        if (hostResumed) {
+          if (reclaimAttempts < RECLAIM_DELAYS_MS.length) {
+            reclaimCode();
+            return;
+          }
+        } else if (!codeRerolled) {
+          rerollCode();
+          return;
+        }
+        // Out of retries: leave OPENING, which would otherwise hang forever.
+        if (link) { link.destroy(); link = null; }
+        app.net = NET.LOST;
       }
       app.notice = describePeerError(err);
       draw();
@@ -850,6 +890,9 @@ function resumeP2P(session) {
   app.me.isOwner = true;
   app.me.isHost = !serverConfigured();   // same branch as startP2P
   app.net = NET.OPENING;
+  hostResumed = true;
+  codeRerolled = false;
+  reclaimAttempts = 0;
   app.pub = engine.publicState();
   lastMoveKey = moveKey();
 
