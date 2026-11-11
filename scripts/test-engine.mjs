@@ -469,6 +469,42 @@ section('lobby');
   eq(engine.playerById('b').connected, true, 'reconnected');
 }
 
+section('ending a game early');
+{
+  // Black 3 discs vs white 1: black is ahead.
+  const lead = twoPlayerGame({
+    size: 6, turn: BLACK,
+    rows: ['......', '......', '..WBB.', '...B..', '......', '......'],
+  });
+  eq(lead.endedEarly, false, 'a fresh game is not ended early');
+  ok(lead.endGame().ok, 'the owner can end a running game');
+  eq(lead.endedEarly, true, 'flagged as ended early');
+  eq(lead.phase, PHASES.GAME_OVER, 'game over');
+  eq(lead.winner, BLACK, 'the leader is still recorded');
+  const text = lead.log[lead.log.length - 1].text;
+  ok(/^Game ended early\. .+ led, 3-1\.$/.test(text), `log names the leader, leader's count first (${text})`);
+  ok(!/wins/.test(text), 'and does not call it a win');
+  eq(new GameEngine().restore(JSON.parse(JSON.stringify(lead.serialize()))).endedEarly, true, 'serialize/restore round-trips it');
+  eq(lead.publicState().endedEarly, true, 'publicState carries it');
+  ok(validPublicState(JSON.parse(JSON.stringify(lead.publicState()))) !== null, 'validPublicState accepts it');
+  eq(validPublicState({ ...lead.publicState(), endedEarly: 'yes' }), null, 'but not a non-boolean');
+  ok(validPublicState((() => { const p = lead.publicState(); delete p.endedEarly; return p; })()) !== null, 'or its absence');
+  ok(lead.playAgain().ok, 'a rematch starts');
+  eq(lead.endedEarly, false, 'and clears it');
+  lead.endGame();
+  lead.backToLobby();
+  eq(lead.endedEarly, false, 'back to lobby clears it too');
+
+  const level = twoPlayerGame({
+    size: 6, turn: BLACK,
+    rows: ['......', '......', '..WB..', '......', '......', '......'],
+  });
+  level.endGame();
+  ok(/^Game ended early, level at 1-1\.$/.test(level.log[level.log.length - 1].text), 'a tie reads as level');
+  eq(level.winner, DRAW, 'recorded as a draw');
+  ok(!level.endGame().ok, 'nothing to end once over');
+}
+
 section('serialize / restore');
 {
   seed(11);

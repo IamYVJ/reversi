@@ -375,7 +375,7 @@ function gameScreen(app, intents) {
     scoreboard(pub),
     over ? resultBanner(pub) : turnBanner(app, pub),
     boardGrid({ app, intents, pub, board, legal, over }),
-    over ? resultActions(app, intents) : null,
+    over ? resultActions(app, intents) : endGameAction(app, intents),
     moveLog(pub),
   );
 }
@@ -396,6 +396,11 @@ function canAct(app, pub) {
 function announcement(pub) {
   if (pub.phase === PHASES.GAME_OVER) {
     const { black, white } = pub.finalScore || pub.score;
+    if (pub.endedEarly) {
+      return pub.winner === DRAW
+        ? `Game ended early. Level, ${black} to ${white}.`
+        : `Game ended early. ${seatLabel(pub, pub.winner)} led, ${pub.winner === BLACK ? black : white} to ${pub.winner === BLACK ? white : black}.`;
+    }
     if (pub.winner === DRAW) return `Game over. Drawn, ${black} to ${white}.`;
     const name = pub.players.find((p) => p.seat === pub.winner);
     // Winner's count first: under Anti-Othello that is the smaller number.
@@ -454,6 +459,17 @@ function turnBanner(app, pub) {
 function resultBanner(pub) {
   const { black, white, empty } = pub.finalScore || { ...pub.score, empty: 0 };
   const drawn = pub.winner === DRAW;
+  if (pub.endedEarly) {
+    // The no-legal-move note below would be false here, so it is skipped.
+    return el('div', { class: 'banner banner-result' },
+      el('p', { class: 'result-line' }, 'Game ended early'),
+      el('p', { class: 'result-note' },
+        drawn ? 'Level' : `${seatLabel(pub, pub.winner)} led`),
+      el('p', { class: 'result-score' },
+        drawn ? `${black} – ${white}`
+          : `${pub.winner === BLACK ? black : white} – ${pub.winner === BLACK ? white : black}`),
+    );
+  }
   return el('div', { class: 'banner banner-result' },
     el('p', { class: 'result-line' },
       drawn ? 'Drawn game' : `${seatLabel(pub, pub.winner)} wins`),
@@ -465,6 +481,22 @@ function resultBanner(pub) {
       ? el('p', { class: 'result-note' },
         `Neither player had a legal move with ${empty} ${empty === 1 ? 'square' : 'squares'} still empty.`)
       : null,
+  );
+}
+
+// Owner-only escape hatch while a game is running. A guest never sees it: the
+// engine would refuse their intent anyway, and a dead button is worse than none.
+function endGameAction(app, intents) {
+  if (!app.me.isOwner) return null;
+  return el('div', { class: 'action-row' },
+    el('button', {
+      class: 'btn btn-ghost', type: 'button', 'data-focus': 'end-game',
+      onClick: () => {
+        if (window.confirm('End this game now? The result will be recorded as ended early.')) {
+          intents.send({ type: 'endGame' });
+        }
+      },
+    }, 'End game'),
   );
 }
 

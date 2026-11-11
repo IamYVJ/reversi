@@ -148,6 +148,10 @@ export class GameEngine {
     this.log = [];
     this.winner = null;     // BLACK | WHITE | DRAW
     this.finalScore = null;
+    // True when the owner stopped the game rather than the rules ending it.
+    // The winner is still computed from the discs so the record stays
+    // meaningful, but every surface must not call it a win.
+    this.endedEarly = false;
     this.gamesPlayed = 0;
     // Which colour the first-listed player took this game. Flipped by
     // playAgain so a rematch does not hand the same person black twice.
@@ -283,6 +287,7 @@ export class GameEngine {
     this.lastPass = null;
     this.winner = null;
     this.finalScore = null;
+    this.endedEarly = false;
     this.log = [];
     this.phase = PHASES.PLAY;
     this._log(`${this.seatName(BLACK)} opens.`, BLACK);
@@ -356,20 +361,29 @@ export class GameEngine {
     this.phase = PHASES.GAME_OVER;
     this.gamesPlayed++;
     this.lastPass = null;
+    const lead = winner === BLACK ? black : white;
+    const trail = winner === BLACK ? white : black;
     // The winner's count comes first. Under Anti-Othello the winner has the
     // FEWER discs, so "larger first" would read as the loser's score.
-    this._log(
-      winner === DRAW
+    let text;
+    if (this.endedEarly) {
+      // Not "wins": nobody finished the game, so only say who led.
+      text = winner === DRAW
+        ? `Game ended early, level at ${black}-${white}.`
+        : `Game ended early. ${this.seatName(winner)} led, ${lead}-${trail}.`;
+    } else {
+      text = winner === DRAW
         ? `Drawn, ${black}-${white}.`
-        : `${this.seatName(winner)} wins ${winner === BLACK ? black : white}-${winner === BLACK ? white : black}.`,
-      winner === DRAW ? null : winner,
-    );
+        : `${this.seatName(winner)} wins ${lead}-${trail}.`;
+    }
+    this._log(text, winner === DRAW ? null : winner);
   }
 
   // Owner escape hatch: ends a game that is running. Distinct from _finish,
   // which is the rules deciding the game is over.
   endGame() {
     if (this.phase !== PHASES.PLAY) return fail('Nothing to end.');
+    this.endedEarly = true;
     this._finish();
     return OK;
   }
@@ -410,6 +424,7 @@ export class GameEngine {
     this.lastPass = null;
     this.winner = null;
     this.finalScore = null;
+    this.endedEarly = false;
     this.log = [];
     return OK;
   }
@@ -456,6 +471,7 @@ export class GameEngine {
       log: this.log.map((e) => ({ ...e })),
       winner: this.winner,
       finalScore: this.finalScore ? { ...this.finalScore } : null,
+      endedEarly: this.endedEarly,
       gamesPlayed: this.gamesPlayed,
       startSeat: this.startSeat,
     };
@@ -486,6 +502,7 @@ export class GameEngine {
     this.log = restoreLog(snapshot.log);
     this.winner = snapshot.winner === DRAW || isSeat(snapshot.winner) ? snapshot.winner : null;
     this.finalScore = restoreScore(snapshot.finalScore);
+    this.endedEarly = snapshot.endedEarly === true;
 
     const phase = Object.values(PHASES).includes(snapshot.phase) ? snapshot.phase : PHASES.LOBBY;
     if (phase !== PHASES.LOBBY && this.players.length !== MAX_PLAYERS) {
@@ -500,6 +517,7 @@ export class GameEngine {
       this.lastPass = null;
       this.winner = null;
       this.finalScore = null;
+      this.endedEarly = false;
       this.phase = PHASES.LOBBY;
     } else {
       this.phase = phase;
@@ -524,6 +542,7 @@ export class GameEngine {
       log: this.log.map((e) => ({ ...e })),
       winner: this.winner,
       finalScore: this.finalScore ? { ...this.finalScore } : null,
+      endedEarly: this.endedEarly,
       score: this.score(),
       gamesPlayed: this.gamesPlayed,
     };

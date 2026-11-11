@@ -170,5 +170,9 @@ export function validPublicState(raw) {
     return null;
   }
 
+  // Optional so a peer on an older build (which never sends it) still works;
+  // the renderer only tests truthiness, but a non-boolean is a malformed peer.
+  if (raw.endedEarly !== undefined && typeof raw.endedEarly !== 'boolean') return null;
+
   return raw;
 }
