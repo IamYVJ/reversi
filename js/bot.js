@@ -364,10 +364,13 @@ export const BOT_THINK_MS = 600;
 export function createBotDriver({ thinkMs = BOT_THINK_MS, budgetMs = SEARCH_BUDGET_MS } = {}) {
   let pending = null;
 
-  // Identifies one bot turn. Keyed on plies, which only ever increases. A pass
-  // does not advance it, but a pass also cannot leave the same bot to move
-  // twice in a row — the engine only passes when the OTHER side has a move —
-  // so the key cannot go stale mid-turn.
+  // Identifies one bot turn. Keyed on plies, which only ever increases: every
+  // completed move increments it. A pass does not advance it, and a pass CAN
+  // leave the same bot to move twice in a row (the human has no legal move, so
+  // the engine skips them). That is still safe: the bot's second consecutive
+  // turn comes after its first move, which bumped plies, so the two turns get
+  // different keys. A pass alone never hands the turn over without a move in
+  // between, so the key cannot go stale mid-turn.
   function turnKey(engine) {
     const player = engine.currentPlayer;
     if (!player || !player.isBot) return null;

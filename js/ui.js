@@ -646,14 +646,35 @@ const ARROWS = {
   ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1],
 };
 
+// Home/End jump to the row's ends; with Ctrl (Cmd on Mac, which has no Home/End
+// keys of its own and reaches them through Cmd+arrows) they jump to the board's
+// corners. This is the WAI-ARIA grid pattern. Returns the target [row, col], or
+// null when the key is not a grid-navigation key so it falls through untouched.
+function keyTarget(event, from, size) {
+  const row = rowOf(from, size);
+  const col = colOf(from, size);
+  const whole = event.ctrlKey || event.metaKey;
+  const last = size - 1;
+  switch (event.key) {
+    case 'Home': return [whole ? 0 : row, 0];
+    case 'End': return [whole ? last : row, last];
+    default: {
+      const step = ARROWS[event.key];
+      if (!step) return null;
+      return [
+        Math.min(last, Math.max(0, row + step[0])),
+        Math.min(last, Math.max(0, col + step[1])),
+      ];
+    }
+  }
+}
+
 function onBoardKey(event, size) {
-  const step = ARROWS[event.key];
-  if (!step) return;
-  event.preventDefault();
   const from = cursor === null ? 0 : cursor;
-  const row = Math.min(size - 1, Math.max(0, rowOf(from, size) + step[0]));
-  const col = Math.min(size - 1, Math.max(0, colOf(from, size) + step[1]));
-  const target = cellAt(row, col, size);
+  const dest = keyTarget(event, from, size);
+  if (!dest) return;
+  event.preventDefault();
+  const target = cellAt(dest[0], dest[1], size);
   if (target === from) return;
   cursor = target;
   const node = event.currentTarget.querySelector(`[data-cell="${target}"]`);
