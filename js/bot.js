@@ -56,10 +56,18 @@ const WIN_SCORE = 1e6;
 const DEPTH_BONUS = 1000;
 
 // What one point of mobility advantage is worth against one point of
-// positional value. Mobility dominates for most of the game — a player with no
-// good moves is forced to wreck their own position — so this is deliberately
-// large. It stops the bot trading its whole structure for a few extra discs.
-const MOBILITY_WEIGHT = 12;
+// positional value, as a range: the weight slides linearly with how empty the
+// board is, from OPENING on a fresh board down to ENDGAME on a full one.
+//
+// Early on mobility dominates — a player with no good moves is forced to wreck
+// their own position — so the opening weight is deliberately large. It stops
+// the bot trading its whole structure for a few extra discs. But the same
+// weight late in the game is a trap: mobility is normalised to +-100, so at 12
+// it can swing +-1200 against a corner's +100 and the bot will give up a corner
+// (which can never be flipped back) for a sliver of mobility. Late on, corners
+// and stable discs decide the game, so the weight is allowed to fall.
+const MOBILITY_OPENING = 12;
+const MOBILITY_ENDGAME = 4;
 
 // Disc count barely matters until the board is nearly full, because anything
 // can flip back. Weighted near zero and left in only so that two otherwise
@@ -321,7 +329,13 @@ function evaluate(board, player, size, state, myMoves) {
 
   const discs = anti ? theirs - mine : mine - theirs;
 
-  return positional + MOBILITY_WEIGHT * mobility + DISC_WEIGHT * discs;
+  // Empties come free from the counts above. Interpolated rather than stepped
+  // so the evaluation has no cliff for the search to dive off at some depth.
+  const emptyFraction = (board.length - mine - theirs) / board.length;
+  const mobilityWeight = MOBILITY_ENDGAME
+    + (MOBILITY_OPENING - MOBILITY_ENDGAME) * emptyFraction;
+
+  return positional + mobilityWeight * mobility + DISC_WEIGHT * discs;
 }
 
 // ===========================================================================
