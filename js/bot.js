@@ -132,6 +132,11 @@ function greedyPick(moves, anti) {
   return shuffle(tied)[0].cell;
 }
 
+// Scores are floats (mobility is a fraction), so "tied" needs a tolerance
+// far smaller than any real difference between positions, yet far above
+// float rounding at WIN_SCORE magnitudes (~1e-10).
+const TIE_EPS = 1e-6;
+
 /**
  * Medium and Hard: alpha-beta, widened one ply at a time.
  *
@@ -155,7 +160,15 @@ function searchBest(board, player, size, ctx) {
 
     for (const cell of order) {
       const next = applyTo(board, cell, player, size, moves.get(cell));
-      const score = -negamax(next, opponent(player), size, depth - 1, -Infinity, -alpha, state);
+      // The window's far edge sits EPS above -alpha, not exactly on it. With
+      // beta = -alpha a move that merely TIES the best so far is cut off and
+      // comes back as a bound ("no better than alpha") that is numerically
+      // equal to alpha — indistinguishable from an exact tie, and Reversi
+      // transposes enough that this happens constantly. The shuffle below
+      // would then pick a refuted move. Widening by EPS makes a true tie
+      // search to an exact value, while anything genuinely worse still fails
+      // low to a bound strictly under alpha - so it can never join the tie.
+      const score = -negamax(next, opponent(player), size, depth - 1, -Infinity, -alpha + TIE_EPS, state);
       if (state.out) break;
       ranked.push({ cell, score });
       if (score > alpha) alpha = score;
@@ -174,6 +187,25 @@ function searchBest(board, player, size, ctx) {
   }
 
   return chosen;
+}
+
+/**
+ * Test hook: the exact full-window value of every root move at `depth`, as
+ * { cell: score } from the mover's point of view. Lets a test check that
+ * chooseMove's pick is truly optimal without duplicating the evaluator.
+ */
+export function rootScores(board, player, config = {}, depth = DEPTHS.medium) {
+  const size = boardSizeFor(config);
+  const state = {
+    weights: weightsFor(size), size, anti: antiOthelloOn(config),
+    deadline: Infinity, clock: Date.now, nodes: 0, out: false,
+  };
+  const out = new Map();
+  for (const [cell, flips] of legalMoveMap(board, player, size)) {
+    const next = applyTo(board, cell, player, size, flips);
+    out.set(cell, -negamax(next, opponent(player), size, depth - 1, -Infinity, Infinity, state));
+  }
+  return out;
 }
 
 /**

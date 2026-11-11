@@ -19,7 +19,7 @@ import {
 } from '../js/rules.js';
 import { GameEngine, PHASES, DRAW, boardFrom } from '../js/state.js';
 import { applyGameIntent, GAME_INTENTS, PLAYER_INTENTS, OWNER_INTENTS } from '../js/intents.js';
-import { chooseMove, createBotDriver, BOT_THINK_MS, SEARCH_BUDGET_MS } from '../js/bot.js';
+import { chooseMove, rootScores, createBotDriver, BOT_THINK_MS, SEARCH_BUDGET_MS } from '../js/bot.js';
 import {
   validEnvelope, validCell, validConfigPatch, validClientId, validNameField,
   validPublicState, decodePeerFrame, TokenBucket,
@@ -896,6 +896,45 @@ section('bot: the search values corners');
       `${level} refuses the X-square beside an empty corner`,
     );
   }
+}
+
+section('bot: ties are only ever between exact scores');
+{
+  // Alpha-beta returns only an upper bound for a root move that is refuted,
+  // and on a transposing game that bound often equals the best score. If the
+  // bot shuffles among "equal" scores it can pick such a move even though its
+  // true value is worse. Check the pick against the exact full-window values.
+  seed(7);
+  const cfg = { boardSize: 6, level: 'medium', deadline: Infinity };
+  const POSITIONS = pick(25, 150);
+  let checked = 0;
+  let bad = 0;
+  let worst = null;
+  let board = openingBoard(6);
+  let player = BLACK;
+  while (checked < POSITIONS) {
+    const legal = legalMoves(board, player, 6);
+    if (!legal.length) {
+      if (!hasLegalMove(board, opponent(player), 6)) { board = openingBoard(6); player = BLACK; continue; }
+      player = opponent(player);
+      continue;
+    }
+    if (legal.length > 1) {
+      const exact = rootScores(board, player, cfg);
+      const best = Math.max(...exact.values());
+      for (let k = 0; k < 3; k++) {
+        const cell = chooseMove(board, player, cfg);
+        const got = exact.get(cell);
+        if (got !== best) { bad++; worst = { got, best }; }
+      }
+      checked++;
+    }
+    // Advance on a random legal move so positions vary.
+    const mv = legal[randomBelow(legal.length)];
+    board = applyMove(board, mv, player, 6).board;
+    player = opponent(player);
+  }
+  ok(bad === 0, `medium never picks a move worse than the exact best (${bad} bad picks in ${checked} positions${worst ? `, e.g. ${worst.got} vs ${worst.best}` : ''})`);
 }
 
 section('bot: deeper levels play stronger');
