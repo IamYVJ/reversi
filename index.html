@@ -48,12 +48,33 @@
        window.Peer and throws a readable error if it is missing, which is what
        an offline first load or a blocked CDN looks like.
 
-       Loaded before main.js but NOT deferred behind it. The service worker
-       caches it best-effort (EXTERNAL in sw.js, never SHELL) so a failed CDN
-       cannot break the install: hotseat and bot mode must still work with this
-       file unavailable, which is why net.js is the only module that touches
-       it and why it reads window.Peer lazily rather than at import time. -->
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+       `defer`, so a slow (not failed) CDN cannot block parsing and hold up
+       hotseat and bot mode with it. Ordering is still safe: a module script is
+       deferred by default, and all deferred scripts (classic `defer` and
+       module alike) execute in document order after parsing, so this runs
+       to completion before main.js does. A fetch that errors just fires the
+       tag's error event and main.js runs without window.Peer. The service
+       worker caches the file best-effort (EXTERNAL in sw.js, never SHELL) so a
+       failed CDN cannot break the install: hotseat and bot mode must still
+       work with this file unavailable, which is why net.js is the only module
+       that touches it and why it reads window.Peer lazily rather than at
+       import time.
+
+       integrity pins the exact bytes (sha384 of peerjs@1.5.4's
+       dist/peerjs.min.js, checked to be served directly with no redirect to
+       another version), so a compromised or swapped CDN file is refused
+       instead of executed with full page privileges. SRI on a cross-origin
+       script requires a CORS fetch, hence crossorigin="anonymous"; unpkg
+       sends Access-Control-Allow-Origin: *. That also keeps sw.js happy: it
+       precaches with { mode: 'cors' } and the page request is now CORS-mode
+       too, so the cached response is a non-opaque one that SRI can verify.
+       Changing the pinned version means regenerating this hash. -->
+  <script
+    src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"
+    integrity="sha384-nlUQ8ZqCbvStErob+biJNzSgltf6urV3VGqhfIfzhmg9RXmpeRm76ELw0pYnKlTR"
+    crossorigin="anonymous"
+    defer
+  ></script>
 
   <script type="module" src="./js/main.js"></script>
 

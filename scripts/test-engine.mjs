@@ -1911,6 +1911,16 @@ section('packaging: the page, the manifest and the worker agree');
   // Best-effort only. In SHELL it would be a CDN hiccup failing the whole
   // install, and hotseat and bot mode do not need the file at all.
   ok(!shell.has(`https://${pinned[0]}`), 'but PeerJS is not in SHELL');
+
+  // The tag itself: SRI needs a CORS fetch (crossorigin), and defer keeps a
+  // slow CDN from blocking parsing while main.js (a module, so also deferred)
+  // still runs after it in document order.
+  const peerTag = html.match(/<script\b[^>]*unpkg\.com\/peerjs@[^>]*>/);
+  ok(!!peerTag, 'the PeerJS script tag is found');
+  ok(/\bintegrity="sha384-[A-Za-z0-9+/]{64}"/.test(peerTag[0]), 'PeerJS carries a sha384 integrity hash');
+  ok(/\bcrossorigin="anonymous"/.test(peerTag[0]), 'PeerJS is fetched in CORS mode, as SRI and the worker cache need');
+  ok(/\bdefer\b/.test(peerTag[0]), 'PeerJS is deferred');
+  ok(html.indexOf(peerTag[0]) < html.indexOf('src="./js/main.js"'), 'and precedes main.js in document order');
 }
 
 section('packaging: the felt does not evict the squares it sits behind');
