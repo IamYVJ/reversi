@@ -240,11 +240,17 @@ function seatRow(player, app, intents) {
       ? el('input', {
         class: 'name-input',
         type: 'text',
-        value: player.name,
+        // A draft, while there is one, is what the person has actually typed
+        // and wins over the engine's cleaned-up copy: otherwise the rebuild
+        // would swallow a trailing space or put "Black" back mid-edit.
+        value: app.nameDrafts && app.nameDrafts[player.id] !== undefined
+          ? app.nameDrafts[player.id] : player.name,
         maxlength: '20',
         'aria-label': `${player.seat === BLACK ? 'Black' : 'White'} player name`,
         'data-focus': `name-${player.id}`,
         onInput: (e) => intents.setPlayerName(player.id, e.target.value),
+        onChange: () => intents.commitPlayerName(player.id),
+        onKeydown: (e) => { if (e.key === 'Enter') e.target.blur(); },
       })
       : el('span', { class: 'seat-name' },
         player.isBot ? `${player.name} · ${nameFor(player.botLevel)}` : player.name),

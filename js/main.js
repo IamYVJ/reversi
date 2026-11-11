@@ -49,6 +49,7 @@ const app = {
   code: '',                // the room code, in p2p only
   net: '',                 // transport status; see NET below. '' means offline modes
   joinCode: loadLastCode(),// the join box's contents, seeded with the last room
+  nameDrafts: {},          // playerId -> raw text of a name field being edited
 };
 
 // What the connection is doing, in the guest's and host's own words. Held as a
@@ -191,6 +192,7 @@ function reclaimCode() {
 function startP2P() {
   const code = generateRoomCode();
   engine.reset();
+  resetNameDrafts();
   engine.addPlayer(app.me.id, app.me.name || 'Player 1');
 
   app.mode = 'p2p';
@@ -307,6 +309,7 @@ function joinRoom(raw) {
   }
 
   engine.reset();
+  resetNameDrafts();
   app.mode = 'p2p';
   app.screen = 'lobby';
   app.code = code;
@@ -460,6 +463,7 @@ function refreshThinking() {
 
 // --- Render loop -----------------------------------------------------------
 
+let drawing = false;     // true while render() is rebuilding #app
 let lastView = null;
 let lastMoveKey = null;
 
@@ -480,6 +484,9 @@ function moveKey() {
 }
 
 function draw() {
+  // A draft belongs to a lobby name field. Leaving the lobby (game start, home)
+  // destroys the field without a blur, so the draft is dropped here as well.
+  if (app.screen !== 'lobby') resetNameDrafts();
   app.thinking = bots.isThinking(engine, Date.now());
 
   const view = viewKey();
@@ -503,8 +510,13 @@ function draw() {
   root.classList.toggle('rerender', sameView);
   root.classList.toggle('fresh-move', freshMove);
 
-  clear(root);
-  render(root, app, intents);
+  drawing = true;
+  try {
+    clear(root);
+    render(root, app, intents);
+  } finally {
+    drawing = false;
+  }
 
   if (focusKey) {
     const next = root.querySelector(`[data-focus="${CSS.escape(focusKey)}"]`);
@@ -558,6 +570,7 @@ function startBot() {
 function startLocal(mode, seat) {
   dropLink();
   engine.reset();
+  resetNameDrafts();
   seat();
   app.mode = mode;
   app.screen = 'lobby';
@@ -572,6 +585,7 @@ function startLocal(mode, seat) {
 
 function goHome() {
   engine.reset();
+  resetNameDrafts();
   clearSession();
   stopBotTick();
   bots.reset();
@@ -594,13 +608,63 @@ function goHome() {
 // Renaming goes through the dispatcher like everything else, so a guest's
 // change reaches the host and comes back in the next broadcast. The only part
 // that stays local is remembering the name for next time.
+//
+// Typing only updates a raw DRAFT. Cleaning every keystroke trims the trailing
+// space (so "John Smith" can't be typed left to right), snaps an emptied field
+// to "Black" mid-edit, and in p2p lets a slow echo from the host overwrite
+// characters typed since. The name is committed when typing pauses and again
+// on blur/Enter; ui.js renders the draft until then.
+const NAME_COMMIT_MS = 400;
+const nameTimers = {};
+
 function setPlayerName(playerId, raw) {
+  app.nameDrafts[playerId] = raw;
+  clearTimeout(nameTimers[playerId]);
+  nameTimers[playerId] = setTimeout(() => sendDraftName(playerId, false), NAME_COMMIT_MS);
+}
+
+// Sends the draft as a rename. Returns whether an intent went out (and so a
+// redraw is already on its way). `final` is false for the pause-in-typing
+// commit, which leaves an empty field alone: "Black" is the fallback for a
+// field that was left empty, not for one being rewritten.
+function sendDraftName(playerId, final) {
+  const raw = app.nameDrafts[playerId];
+  if (raw === undefined) return false;
   const name = cleanName(raw);
+  if (!final && !name) return false;
+  const current = app.pub && app.pub.players.find((p) => p.id === playerId);
+  if (current && current.name === name) return false;
+  // On the final commit the draft goes BEFORE the intent: sendIntent redraws
+  // synchronously on the host, and that redraw must show the engine's name.
+  if (final) delete app.nameDrafts[playerId];
   if (playerId === app.me.id) {
     app.me.name = name;
     saveName(name);
   }
   sendIntent({ type: 'setName', playerId, name });
+  return true;
+}
+
+// Blur or Enter: the edit is over, so commit, drop the draft, and redraw so
+// the field shows the engine's cleaned name (trimmed, or the fallback).
+function commitPlayerName(playerId) {
+  // Chrome fires change on a focused, edited field the moment draw() tears it
+  // out of the DOM. That is a rebuild, not the person finishing: committing
+  // then would redraw in the middle of the teardown (and throw), and the draft
+  // has to survive for the replacement field anyway.
+  if (drawing) return;
+  clearTimeout(nameTimers[playerId]);
+  const sent = sendDraftName(playerId, true);
+  delete app.nameDrafts[playerId];
+  // No intent means nothing redrew; a guest's redraw waits for the host's echo
+  // and would flash the old name meanwhile, so it repaints from the draft's
+  // cleaned form only when nothing was sent.
+  if (!sent) draw();
+}
+
+function resetNameDrafts() {
+  for (const id of Object.keys(nameTimers)) clearTimeout(nameTimers[id]);
+  app.nameDrafts = {};
 }
 
 const intents = {
@@ -611,6 +675,7 @@ const intents = {
   startP2P,
   joinRoom,
   setPlayerName,
+  commitPlayerName,
   setJoinCode(raw) {
     app.joinCode = normalizeCode(raw);
     // Redraws even when the value did not change, which is the case that
