@@ -193,6 +193,10 @@ export class GameEngine {
   startGame() {
     if (this.phase === PHASES.PLAY) return fail('Already playing.');
     if (this.players.length !== MAX_PLAYERS) return fail('Reversi needs exactly two players.');
+    // A seat held for a dropped guest is not an opponent: starting now would
+    // deal a game nobody is there to play.
+    const away = this._absentPlayer();
+    if (away) return fail(`Waiting for ${away.name} to reconnect.`);
 
     this.size = boardSizeFor(this.config);
     this.board = openingBoard(this.size);
@@ -293,12 +297,31 @@ export class GameEngine {
 
   playAgain() {
     if (this.phase !== PHASES.GAME_OVER) return fail('Finish this game first.');
+    // Checked before the colours swap: startGame would refuse too, but by then
+    // the seats would already have flipped under a rematch that never began.
+    const away = this._absentPlayer();
+    if (away) return fail(`Waiting for ${away.name} to reconnect.`);
     for (const p of this.players) p.seat = opponent(p.seat);
     this.startSeat = opponent(this.startSeat);
     return this.startGame();
   }
 
+  // A player whose connection dropped mid-game, kept seated so a reconnect
+  // lands back in the same colour. Bots never disconnect, so they never match.
+  _absentPlayer() {
+    return this.players.find((p) => p.connected === false) || null;
+  }
+
   backToLobby() {
+    // Seats held for absent players only make sense while a game is on. Back in
+    // the lobby they would block the room ("This game is full.") and let a game
+    // start against nobody, so release them.
+    const owner = this.ownerId;
+    this.players = this.players.filter((p) => p.connected !== false);
+    if (owner && !this.playerById(owner)) {
+      const heir = this.players.find((p) => !p.isBot);
+      this.ownerId = heir ? heir.id : null;
+    }
     this.phase = PHASES.LOBBY;
     this.size = boardSizeFor(this.config);
     this.board = openingBoard(this.size);

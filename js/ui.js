@@ -212,8 +212,10 @@ function lobbyScreen(app, intents) {
       type: 'button',
       // Reversi needs exactly two. The engine refuses a short table anyway;
       // this is so the owner is not invited to press a button that cannot work
-      // while they are still waiting for someone to arrive.
-      disabled: !app.me.isOwner || pub.players.length !== 2,
+      // while they are still waiting for someone to arrive. Same for a player
+      // who has dropped and not yet reconnected.
+      disabled: !app.me.isOwner || pub.players.length !== 2
+        || pub.players.some((p) => p.connected === false),
       'data-focus': 'start-game',
       onClick: () => {
         intents.send({ type: 'startGame' });

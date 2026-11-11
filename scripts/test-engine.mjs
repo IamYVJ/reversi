@@ -512,6 +512,68 @@ section('play again and back to lobby');
   eq(engine.size, 10, 'and the preview board resizes immediately');
 }
 
+section('absent players and the lobby');
+{
+  const setup = () => {
+    const e = new GameEngine();
+    e.addPlayer('host1', 'Host');
+    e.addPlayer('guest1', 'Guest');
+    e.startGame();
+    return e;
+  };
+
+  const e = setup();
+  e.removePlayer('guest1');
+  eq(e.players.length, 2, 'mid-game the dropped guest keeps their seat');
+  e.endGame();
+  const seatBefore = e.playerById('host1').seat;
+  const refusedAgain = e.playAgain();
+  ok(!refusedAgain.ok, 'play again is refused while the opponent is away');
+  ok(/Guest/.test(refusedAgain.error),
+    'and names who we are waiting for');
+  eq(e.playerById('host1').seat, seatBefore, 'a refused rematch does not swap colours');
+  eq(e.phase, PHASES.GAME_OVER, 'and stays on the results');
+
+  ok(e.backToLobby().ok, 'back to the lobby');
+  eq(e.players.length, 1, 'the absent guest is released');
+  ok(!e.startGame().ok, 'cannot start alone');
+  ok(e.addPlayer('newguest1', 'New').ok, 'a new guest can take the freed seat');
+  ok(e.startGame().ok, 'and the game starts');
+
+  const r = setup();
+  r.removePlayer('guest1');
+  r.endGame();
+  ok(r.addPlayer('guest1', 'Guest').ok, 'a reconnect with the same id');
+  ok(r.playAgain().ok, 'makes the rematch work again');
+
+  const h = setup();
+  h.endGame();
+  h.backToLobby();
+  h.removePlayer('guest1');
+  h.addPlayer('guest1', 'Guest');
+  h.players.find((p) => p.id === 'guest1').connected = false;
+  ok(!h.startGame().ok, 'startGame refused in the lobby when a seated player is away');
+  h.players.find((p) => p.id === 'guest1').connected = true;
+  ok(h.startGame().ok, 'and allowed once they say hello');
+
+  const o = setup();
+  o.removePlayer('host1');
+  o.endGame();
+  o.backToLobby();
+  eq(o.ownerId, 'guest1', 'ownership passes on if the owner was away');
+  eq(o.players.length, 1, 'only the present player remains');
+
+  const b = new GameEngine();
+  b.addPlayer('host1', 'Host');
+  b.addPlayer('bot1', 'Bot', { isBot: true });
+  b.startGame();
+  b.endGame();
+  ok(b.playAgain().ok, 'bots never count as away');
+  b.endGame();
+  b.backToLobby();
+  eq(b.players.length, 2, 'and survive the trip to the lobby');
+}
+
 // --- Rules -----------------------------------------------------------------
 
 section('config normalization');
