@@ -495,7 +495,57 @@ function moveKey() {
   return m ? `${app.pub.plies}:${m.cell}` : null;
 }
 
+// --- Deferred redraws -------------------------------------------------------
+//
+// draw() tears #app down and rebuilds it. Doing that at the wrong moment has
+// two costs. Inside a focused field's blur/change dispatch, Chrome throws
+// NotFoundError on removeChild. And between a button's mousedown and mouseup
+// the pressed button is replaced, so the browser never sees a click on it.
+// So a draw requested while a pointer is held, or from inside commitPlayerName,
+// is parked and run once, just after the gesture's click has been delivered.
+let pointerHeld = false;
+let deferDraws = false;
+let drawPending = false;
+let pendingTimer = null;
+let fallbackTimer = null;
+const DRAW_FALLBACK_MS = 500;
+
+function flushDraw() {
+  clearTimeout(pendingTimer);
+  clearTimeout(fallbackTimer);
+  pendingTimer = fallbackTimer = null;
+  if (!drawPending) return;
+  drawPending = false;
+  draw();
+}
+
+function releasePointer() {
+  if (!pointerHeld) return;
+  pointerHeld = false;
+  // A timeout, not a direct call: pointerup comes BEFORE click, and the click
+  // must land on the still-present button first.
+  if (drawPending) pendingTimer = setTimeout(flushDraw, 0);
+}
+
+// Capture phase on document so no handler's stopPropagation can hide the
+// release. Pointercancel and window blur cover gestures that never get a
+// pointerup; the fallback timer covers anything else, so drawing can't freeze.
+document.addEventListener('pointerdown', () => { pointerHeld = true; }, true);
+document.addEventListener('pointerup', releasePointer, true);
+document.addEventListener('pointercancel', releasePointer, true);
+window.addEventListener('blur', releasePointer);
+
 function draw() {
+  if (pointerHeld || deferDraws) {
+    drawPending = true;
+    if (!pendingTimer && !pointerHeld) pendingTimer = setTimeout(flushDraw, 0);
+    if (!fallbackTimer) fallbackTimer = setTimeout(() => { pointerHeld = false; flushDraw(); }, DRAW_FALLBACK_MS);
+    return;
+  }
+  drawNow();
+}
+
+function drawNow() {
   // A draft belongs to a lobby name field. Leaving the lobby (game start, home)
   // destroys the field without a blur, so the draft is dropped here as well.
   if (app.screen !== 'lobby') resetNameDrafts();
@@ -666,12 +716,21 @@ function commitPlayerName(playerId) {
   // has to survive for the replacement field anyway.
   if (drawing) return;
   clearTimeout(nameTimers[playerId]);
-  const sent = sendDraftName(playerId, true);
-  delete app.nameDrafts[playerId];
-  // No intent means nothing redrew; a guest's redraw waits for the host's echo
-  // and would flash the old name meanwhile, so it repaints from the draft's
-  // cleaned form only when nothing was sent.
-  if (!sent) draw();
+  // This runs inside the field's change/blur dispatch, where a rebuild throws,
+  // and often between a button's mousedown and click, where it would eat the
+  // click. The intent still applies to the engine right here (so the clicked
+  // button's handler sees the new name); only the repaint is deferred.
+  deferDraws = true;
+  try {
+    const sent = sendDraftName(playerId, true);
+    delete app.nameDrafts[playerId];
+    // No intent means nothing redrew; a guest's redraw waits for the host's
+    // echo and would flash the old name meanwhile, so it repaints from the
+    // draft's cleaned form only when nothing was sent.
+    if (!sent) draw();
+  } finally {
+    deferDraws = false;
+  }
 }
 
 function resetNameDrafts() {
