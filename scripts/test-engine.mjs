@@ -35,7 +35,7 @@ import {
   saveSession, loadSession, clearSession, saveEngineSnapshot, loadEngineSnapshot,
 } from '../js/util.js';
 import {
-  PEER_PREFIX, peerIdForCode, codeFromPeerId, isFatalPeerError, describePeerError,
+  PEER_PREFIX, peerIdForCode, codeFromPeerId, isFatalPeerError, describePeerError, createHost,
 } from '../js/net.js';
 import {
   SERVER_URL, SERVER_HEALTH, serverConfigured, HEALTH_TIMEOUT_MS, HEALTH_RETRIES,
@@ -1172,6 +1172,103 @@ section('peer errors are classified and translated');
   }
   eq(describePeerError(null), 'Something went wrong with the connection.',
     'even a null error produces a sentence');
+}
+
+section('host connections survive a re-dial');
+{
+  // net.js reads globalThis.Peer lazily, so a tiny fake stands in for PeerJS.
+  class Emitter {
+    constructor() { this.h = {}; }
+    on(evt, fn) { (this.h[evt] ||= []).push(fn); }
+    emit(evt, ...args) { (this.h[evt] || []).slice().forEach((fn) => fn(...args)); }
+  }
+  class FakePeer extends Emitter {
+    constructor(id) { super(); this.id = id; this.destroyed = false; this.disconnected = false; }
+    destroy() { this.destroyed = true; }
+  }
+  class FakeConn extends Emitter {
+    constructor(peer) { super(); this.peer = peer; this.open = false; this.sent = []; this.closeCalls = 0; }
+    send(str) { this.sent.push(str); }
+    // Like the real thing, close() is slow: the test emits 'close' by hand,
+    // late, to model a WebRTC channel that takes its time to wind down.
+    close() { this.closeCalls++; this.open = false; }
+  }
+  const realPeer = globalThis.Peer;
+  globalThis.Peer = FakePeer;
+  try {
+    const frame = JSON.stringify({ type: 'ping' });
+    const setup = () => {
+      const log = { connect: [], data: [], disc: [], full: [] };
+      const host = createHost('ABCD', {
+        onConnect: (id) => log.connect.push(id),
+        onData: (id, m) => log.data.push([id, m.type]),
+        onDisconnect: (id) => log.disc.push(id),
+        onFull: (id) => log.full.push(id),
+      });
+      const dial = (id) => {
+        const c = new FakeConn(id);
+        host.peer.emit('connection', c);
+        c.open = true; c.emit('open');
+        return c;
+      };
+      return { host, log, dial };
+    };
+
+    // (a) the same guest re-dials; the old channel's late events are stale
+    {
+      const { host, log, dial } = setup();
+      const a = dial('g1');
+      a.emit('data', frame);
+      eq(log.data.length, 1, 'data flows on the first channel');
+      const b = dial('g1');
+      eq(a.closeCalls, 1, 'the superseded channel is closed');
+      eq(host.connections.size, 1, 'the re-dial replaces rather than adds');
+      a.emit('close');
+      a.emit('error');
+      eq(log.disc.length, 0, 'the old channel closing late does not report a disconnect');
+      ok(host.connections.has('g1'), 'the replacement is still registered');
+      host.broadcast({ type: 'state' });
+      eq(b.sent.length, 1, 'broadcast still reaches the new channel');
+      eq(a.sent.length, 0, 'and not the old one');
+      a.emit('data', frame);
+      eq(log.data.length, 1, 'frames from the superseded channel are ignored');
+      b.emit('data', frame);
+      eq(log.data.length, 2, 'frames from the current channel are delivered');
+      // (b) a normal close of the current channel still reports exactly once
+      b.emit('close');
+      b.emit('error');
+      eq(log.disc.length, 1, 'closing the current channel fires onDisconnect once');
+      eq(log.disc[0], 'g1', 'with the right id');
+      eq(host.connections.size, 0, 'and frees the slot');
+    }
+
+    // a replacement is not refused at the connection cap
+    {
+      const { host, log, dial } = setup();
+      for (let i = 0; i < MAX_CONNECTIONS; i++) dial('g' + i);
+      eq(host.connections.size, MAX_CONNECTIONS, 'host is at the cap');
+      const again = dial('g0');
+      eq(log.full.length, 0, 'a re-dial at the cap is not turned away');
+      eq(host.connections.get('g0').conn, again, 'it takes over the seat');
+      dial('stranger');
+      eq(log.full.length, 1, 'a genuinely new peer at the cap is still refused');
+    }
+
+    // (c) dropConnection reports once, and the dropped channel's late close is silent
+    {
+      const { host, log, dial } = setup();
+      const a = dial('g1');
+      host.dropConnection('g1');
+      eq(log.disc.length, 1, 'dropConnection fires onDisconnect once');
+      eq(a.closeCalls, 1, 'and closes the channel');
+      a.emit('close');
+      eq(log.disc.length, 1, 'the late close of a dropped channel does not fire it again');
+      host.dropConnection('g1');
+      eq(log.disc.length, 1, 'dropping an absent connection is a no-op');
+    }
+  } finally {
+    globalThis.Peer = realPeer;
+  }
 }
 
 section('the server seam is present and unwired');
