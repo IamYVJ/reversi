@@ -503,6 +503,93 @@ section('serialize / restore');
   ok(new GameEngine().restore(null) instanceof GameEngine, 'restoring nothing is survivable');
 }
 
+section('restore only trusts what serialize writes');
+{
+  const rt = (e) => JSON.parse(JSON.stringify(e.serialize()));
+  const midGame = () => {
+    seed(23);
+    const e = twoPlayerGame({ size: 8 });
+    for (let i = 0; i < 7; i++) {
+      const cells = [...e.legalMoves().keys()];
+      e.playMove(e.currentPlayer.id, cells[randomBelow(cells.length)]);
+    }
+    return e;
+  };
+
+  // (1) A real mid-game snapshot comes back byte-for-byte.
+  const live = midGame();
+  const snap = rt(live);
+  eq(JSON.stringify(new GameEngine().restore(snap).serialize()), JSON.stringify(live.serialize()),
+    'a mid-game snapshot round-trips exactly');
+  ok(snap.lastMove && snap.log.length > 0, 'and the round-trip really covered a last move and a log');
+
+  // (2) Junk must not reach methods, the phase, or the prototype chain.
+  const protoBefore = Object.getPrototypeOf(new GameEngine());
+  const junk = JSON.parse('{"__proto__":{"polluted":1},"playMove":"x","phase":"nonsense","players":"oops","restore":1}');
+  const hardened = new GameEngine().restore(junk);
+  eq(typeof hardened.playMove, 'function', 'a snapshot cannot overwrite playMove');
+  eq(typeof hardened.restore, 'function', 'nor restore itself');
+  eq(hardened.phase, PHASES.LOBBY, 'an unknown phase falls back to the lobby');
+  eq(JSON.stringify(hardened.players), '[]', 'a non-array player list falls back to none');
+  eq(({}).polluted, undefined, '__proto__ does not pollute Object');
+  eq(hardened.polluted, undefined, 'nor the engine');
+  ok(Object.getPrototypeOf(hardened) === protoBefore, 'and the engine prototype is unchanged');
+  ok(hardened.addPlayer('x', 'X').ok, 'the engine is still usable afterwards');
+
+  // (3) Each malformed field falls back on its own, leaving the rest intact.
+  const bad = (patch) => new GameEngine().restore({ ...snap, ...patch });
+  eq(bad({ lastMove: { cell: 9999, player: BLACK, flips: [] } }).lastMove, null, 'an out-of-range lastMove cell is dropped');
+  eq(bad({ lastMove: { cell: 3, player: BLACK, flips: ['a'] } }).lastMove, null, 'non-integer flips drop lastMove');
+  eq(bad({ lastMove: 'x' }).lastMove, null, 'a non-object lastMove is dropped');
+  eq(bad({ lastPass: { player: 7 } }).lastPass, null, 'a lastPass with no real seat is dropped');
+  const logged = bad({ log: [{ text: 5, seat: BLACK }, { text: 'ok', seat: 'zzz' }, null, { text: 'fine', seat: WHITE }] }).log;
+  eq(JSON.stringify(logged), JSON.stringify([{ text: 'ok', seat: null }, { text: 'fine', seat: WHITE }]),
+    'log entries with non-string text are dropped and a bad seat becomes null');
+  const longLog = Array.from({ length: 40 }, (_, i) => ({ text: 'm' + i, seat: null }));
+  const trimmed = bad({ log: longLog }).log;
+  ok(trimmed.length <= 14 && trimmed[trimmed.length - 1].text === 'm39', 'an oversized log keeps only the latest entries');
+  const dupSeat = bad({ players: [snap.players[0], { ...snap.players[1], seat: snap.players[0].seat }] });
+  eq(dupSeat.players.length, 1, 'a duplicate seat is dropped');
+  eq(dupSeat.phase, PHASES.LOBBY, 'which leaves too few players to resume a game');
+  eq(bad({ players: [snap.players[0], { ...snap.players[1], id: snap.players[0].id }] }).players.length, 1, 'a duplicate id is dropped');
+  eq(bad({ players: [snap.players[0], { id: '', seat: WHITE }, snap.players[1]] }).players.length, 2,
+    'a malformed player entry is skipped without losing the good ones');
+  eq(bad({ plies: -4 }).plies, 0, 'negative plies fall back to zero');
+  eq(bad({ gamesPlayed: 1.5 }).gamesPlayed, 0, 'a fractional game count falls back to zero');
+  eq(bad({ turn: 'x' }).turn, BLACK, 'a bad turn falls back to black');
+  eq(bad({ startSeat: 'x' }).startSeat, BLACK, 'a bad startSeat falls back to black');
+  eq(bad({ winner: 'nobody' }).winner, null, 'an unknown winner is dropped');
+  eq(bad({ finalScore: { black: -1, white: 2, empty: 0 } }).finalScore, null, 'a negative score is dropped');
+  const named = bad({ players: [{ ...snap.players[0], name: 42, isBot: 'yes', connected: 'no' }, snap.players[1]] }).players[0];
+  eq(named.name, 'Player', 'a non-string name gets the default');
+  eq(named.isBot, false, 'a non-boolean isBot is false');
+  eq(named.connected, true, 'a non-boolean connected defaults to present');
+  eq(bad({ ownerId: 'ghost' }).ownerId, snap.players[0].id, 'an owner who is not seated falls back to the first human');
+  eq(bad({ ownerId: 12 }).ownerId, snap.players[0].id, 'a non-string owner falls back too');
+
+  // (4) A game cannot resume without both seats.
+  const onePlayer = bad({ players: [snap.players[0]] });
+  eq(onePlayer.phase, PHASES.LOBBY, 'PLAY with one player restores to the lobby');
+  eq(onePlayer.players.length, 1, 'the lone player stays seated, so the app can still resume the lobby');
+  eq(onePlayer.plies, 0, 'with no moves played');
+  eq(countDiscs(onePlayer.board).black + countDiscs(onePlayer.board).white, 4, 'on a fresh opening board');
+  eq(bad({ players: [] }).phase, PHASES.LOBBY, 'and with no players at all');
+
+  // (5) A finished game keeps its result.
+  const done = twoPlayerGame({
+    size: 6, turn: BLACK,
+    rows: ['......', '......', '..WB..', '......', '......', '......'],
+  });
+  done.playMove('p-black', cellAt(2, 1, 6));
+  eq(done.phase, PHASES.GAME_OVER, 'setup: the game is over');
+  const overSnap = rt(done);
+  const over = new GameEngine().restore(overSnap);
+  eq(over.phase, PHASES.GAME_OVER, 'GAME_OVER survives');
+  eq(over.winner, done.winner, 'the winner survives');
+  eq(JSON.stringify(over.finalScore), JSON.stringify(done.finalScore), 'the final score survives');
+  eq(JSON.stringify(over.serialize()), JSON.stringify(done.serialize()), 'and the whole finished game round-trips');
+}
+
 section('play again and back to lobby');
 {
   const engine = twoPlayerGame({
