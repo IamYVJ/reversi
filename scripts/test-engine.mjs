@@ -55,7 +55,28 @@ function eq(actual, expected, msg) {
   ok(actual === expected, `${msg} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
 }
 
-function section(t) { console.log('\n- ' + t); }
+// Full mode runs the slow statistical sections at their real size; the default
+// run shrinks them so `npm test` stays a quick pre-commit check. See the
+// `pick(fast, full)` call sites — everything else is identical in both modes.
+const FULL = process.argv.includes('--full') || process.env.TEST_FULL === '1';
+const pick = (fast, full) => (FULL ? full : fast);
+
+// Each section header also reports how long the PREVIOUS one took, so a slow
+// section shows up in the output instead of having to be hunted for.
+let sectionName = null;
+let sectionStart = 0;
+function endSection() {
+  if (sectionName === null) return;
+  const ms = Date.now() - sectionStart;
+  if (ms >= 1000) console.log(`  (${sectionName}: ${(ms / 1000).toFixed(1)}s)`);
+}
+function section(t) {
+  endSection();
+  console.log('\n- ' + t);
+  sectionName = t;
+  sectionStart = Date.now();
+}
+console.log(`mode: ${FULL ? 'full' : 'fast (pass --full or TEST_FULL=1 for the whole suite)'}`);
 
 // Deterministic RNG. rules.js reads `crypto` at CALL time, so swapping the
 // global here — before any engine exists — is enough to pin every shuffle and
@@ -713,7 +734,12 @@ section('bot: move legality across levels, sizes and scoring');
   // without ever producing a move the generator would refuse. A small budget
   // keeps this quick while still driving the real iterative-deepening path —
   // a starved search must still return a legal move from a completed depth.
-  const GAMES = 120;
+  //
+  // The cost here is the clock, not the CPU: every move spends its whole 5ms,
+  // so time scales with games played. Fast mode plays one game per
+  // configuration instead of 20, which still covers every level, size and
+  // scoring mode.
+  const GAMES = pick(6, 120);
   for (const level of ['easy', 'medium', 'hard']) {
     let illegal = 0;
     let games = 0;
@@ -877,9 +903,15 @@ section('bot: deeper levels play stronger');
   // Full depth on the small board: hard reaches 6 plies where medium stops at
   // 3, so this measures the depth difference rather than the clock. Colours
   // alternate so neither level keeps the first-move advantage.
+  //
+  // This is the slowest section by far: hard searches six plies with no clock
+  // to cut it short. Fast mode plays fewer games with the floor kept at roughly
+  // the same fraction (about two thirds). The stream is seeded and each trial
+  // replays the same opening games, so the fast games are a prefix of the full
+  // ones — the floors were checked against that exact prefix, not hoped for.
   const trials = [
-    { strong: 'medium', weak: 'easy', n: 20, floor: 13 },
-    { strong: 'hard', weak: 'medium', n: 10, floor: 7 },
+    { strong: 'medium', weak: 'easy', n: pick(8, 20), floor: pick(5, 13) },
+    { strong: 'hard', weak: 'medium', n: pick(5, 10), floor: pick(3, 7) },
   ];
   for (const { strong, weak, n, floor } of trials) {
     seed(42);
@@ -914,15 +946,20 @@ section('bot: the time box holds');
   ok(legalMoves(board, BLACK, 10).includes(cell), 'a search cut off almost immediately still returns a legal move');
 
   // Real clock, real budget: a full 10x10 midgame think must respect the cap.
+  //
+  // A whole game at the real budget is ~50s of pure waiting, so fast mode runs
+  // the same game on a sixth of the budget. The check is relative to whatever
+  // budget was used, so it still catches a box that fails open.
+  const budget = pick(SEARCH_BUDGET_MS / 6, SEARCH_BUDGET_MS);
   let worst = 0;
   seed(13);
-  const r = botGame({ size: 10, levels: { [BLACK]: 'hard', [WHITE]: 'hard' }, budgetMs: SEARCH_BUDGET_MS });
+  const r = botGame({ size: 10, levels: { [BLACK]: 'hard', [WHITE]: 'hard' }, budgetMs: budget });
   worst = r.worst;
   eq(r.illegal, 0, 'a full-budget 10x10 game stays legal throughout');
   // Generous ceiling: the check runs every 256 nodes, so the budget can be
   // overshot by whatever the node in flight costs. This is a guard against
   // the box failing open, not a benchmark.
-  ok(worst <= SEARCH_BUDGET_MS * 2, `worst think ${worst}ms stayed within twice the ${SEARCH_BUDGET_MS}ms budget`);
+  ok(worst <= budget * 2, `worst think ${worst}ms stayed within twice the ${budget}ms budget`);
   console.log(`  10x10 hard, worst think ${worst}ms`);
 }
 
@@ -1360,7 +1397,9 @@ section('a reload lands back in the same game');
 
 section('random full games');
 {
-  const GAMES = 300;
+  // Fast mode keeps every board size and both scoring modes, so each rule path
+  // is still exercised; it only samples fewer random games from each.
+  const GAMES = pick(40, 300);
   for (const size of BOARD_SIZES) {
     for (const antiOthello of [false, true]) {
       seed(size * 1000 + (antiOthello ? 1 : 0));
@@ -1578,5 +1617,6 @@ section('packaging: the felt does not evict the squares it sits behind');
 
 // --- Result ----------------------------------------------------------------
 
+endSection();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
