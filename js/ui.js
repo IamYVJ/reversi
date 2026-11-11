@@ -398,7 +398,8 @@ function announcement(pub) {
     const { black, white } = pub.finalScore || pub.score;
     if (pub.winner === DRAW) return `Game over. Drawn, ${black} to ${white}.`;
     const name = pub.players.find((p) => p.seat === pub.winner);
-    return `Game over. ${name ? name.name : colourWord(pub.winner)} wins, ${Math.max(black, white)} to ${Math.min(black, white)}.`;
+    // Winner's count first: under Anti-Othello that is the smaller number.
+    return `Game over. ${name ? name.name : colourWord(pub.winner)} wins, ${pub.winner === BLACK ? black : white} to ${pub.winner === BLACK ? white : black}.`;
   }
   const parts = [];
   if (pub.lastMove) {

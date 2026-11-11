@@ -397,6 +397,21 @@ section('anti-othello');
   const antiDraw = twoPlayerGame({ size: 6, turn: BLACK, rows: drawRows, antiOthello: true });
   antiDraw.playMove('p-black', cellAt(0, 0, 6));
   eq(antiDraw.winner, DRAW, 'Anti-Othello does not turn a draw into a win');
+
+  // The result line leads with the WINNER's count. Under Anti-Othello that is
+  // the smaller number, so "larger first" would read as the loser's score.
+  const fullRows = (blackRows) => Array.from({ length: 8 }, (_, r) => (r < blackRows ? 'B' : 'W').repeat(8));
+  const lastLine = (e) => e.log[e.log.length - 1].text;
+
+  const normalEnd = twoPlayerGame({ size: 8, rows: fullRows(5) });
+  normalEnd._finish();
+  eq(normalEnd.winner, BLACK, 'black holding 40 of 64 wins normally');
+  ok(/wins 40-24\.$/.test(lastLine(normalEnd)), `normal result line leads with the winner's 40 (${lastLine(normalEnd)})`);
+
+  const antiEnd = twoPlayerGame({ size: 8, rows: fullRows(3), antiOthello: true });
+  antiEnd._finish();
+  eq(antiEnd.winner, BLACK, 'black holding 24 of 64 wins under Anti-Othello');
+  ok(/wins 24-40\.$/.test(lastLine(antiEnd)), `anti result line leads with the winner's 24 (${lastLine(antiEnd)})`);
 }
 
 // --- Engine plumbing -------------------------------------------------------

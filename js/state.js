@@ -279,10 +279,12 @@ export class GameEngine {
     this.phase = PHASES.GAME_OVER;
     this.gamesPlayed++;
     this.lastPass = null;
+    // The winner's count comes first. Under Anti-Othello the winner has the
+    // FEWER discs, so "larger first" would read as the loser's score.
     this._log(
       winner === DRAW
         ? `Drawn, ${black}-${white}.`
-        : `${this.seatName(winner)} wins ${Math.max(black, white)}-${Math.min(black, white)}.`,
+        : `${this.seatName(winner)} wins ${winner === BLACK ? black : white}-${winner === BLACK ? white : black}.`,
       winner === DRAW ? null : winner,
     );
   }
