@@ -281,10 +281,17 @@ function seatGuest(connId, msg) {
   // peer could introduce itself twice and occupy both seats.
   const known = guestIds.get(connId);
   if (known && known !== id) return;
-  // And one channel per identity, so a peer cannot claim the seat someone
-  // else is already sitting in by guessing their clientId.
-  for (const [otherConn, otherId] of guestIds) {
-    if (otherId === id && otherConn !== connId) return;
+  // And one channel per identity, but the NEWEST one wins. A reloaded page
+  // gets a fresh peer id, and WebRTC can take many seconds (or forever) to
+  // notice the old channel died; refusing the newcomer would strand them with
+  // no game state. The clientId is 128 random bits only that browser holds, so
+  // someone presenting it is that player coming back, not an impostor.
+  for (const [otherConn, otherId] of [...guestIds]) {
+    if (otherId !== id || otherConn === connId) continue;
+    // Unmap BEFORE dropping: dropConnection fires onDisconnect, which must
+    // find no identity so it does not mark this returning player away.
+    guestIds.delete(otherConn);
+    link.dropConnection(otherConn);
   }
 
   const seated = engine.addPlayer(id, cleanName(raw) || 'Player 2');
