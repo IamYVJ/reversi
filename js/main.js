@@ -49,6 +49,7 @@ const app = {
   code: '',                // the room code, in p2p only
   net: '',                 // transport status; see NET below. '' means offline modes
   joinCode: loadLastCode(),// the join box's contents, seeded with the last room
+  nameDrafts: {},          // playerId -> raw text of a name field being edited
 };
 
 // What the connection is doing, in the guest's and host's own words. Held as a
@@ -157,33 +158,58 @@ function setNet(status) {
   draw();
 }
 
+// Reclaiming a room code after a reload races the broker, which can still be
+// holding the old socket open and answers 'unavailable-id'. How long it holds
+// on is not ours to know, so a single retry is a coin flip: a bounded backoff
+// gives a mid-game reload several chances to resume instead of telling the
+// host to go and start a new game. It is bounded because if the code is
+// genuinely taken by someone else the answer never changes, and the UI must
+// not sit on "Opening the room…" forever; when the delays run out the host
+// gets NET.LOST and the notice instead.
+const RECLAIM_DELAYS_MS = [2000, 4000, 8000, 8000];
+let reclaimAttempts = 0;
+
+// A resumed room is the only case where 'unavailable-id' means "our own stale
+// socket". For a fresh room it means the random code collided with somebody
+// else's on the shared broker, and waiting will not change that — so a fresh
+// room gets one new code instead of the backoff.
+let hostResumed = false;
+let codeRerolled = false;
+
 function dropLink() {
   if (link) { link.destroy(); link = null; }
   guestIds.clear();
-  idRetried = false;
+  reclaimAttempts = 0;
+  hostResumed = false;
+  codeRerolled = false;
   app.net = '';
 }
 
-// Reclaiming a room code after a reload races the broker, which can still be
-// holding the old socket open for a second or two and answers 'unavailable-id'
-// — fatal only if you ask exactly once. One retry on a generous delay is the
-// difference between a mid-game reload resuming and the host being told to go
-// and start a new game. The flag makes it one retry, not a loop: if the code
-// is genuinely taken by someone else, the second answer is the real one.
-const ID_RETRY_MS = 2000;
-let idRetried = false;
-
 function reclaimCode() {
   const code = app.code;
+  const delay = RECLAIM_DELAYS_MS[reclaimAttempts++];
   if (link) { link.destroy(); link = null; }
   app.net = NET.OPENING;
   setTimeout(() => {
-    // The player may well have gone home in those two seconds.
+    // The player may well have gone home while we waited.
     if (app.mode !== 'p2p' || !app.me.isHost || app.code !== code) return;
     if (!openLink(() => createHost(code, hostHandlers()))) return;
     hostSync();
-  }, ID_RETRY_MS);
+  }, delay);
   draw();
+}
+
+// A freshly generated code collided with another live room. Pick another and
+// open again, once; after that the broker is telling us something real.
+function rerollCode() {
+  codeRerolled = true;
+  if (link) { link.destroy(); link = null; }
+  const code = generateRoomCode();
+  app.code = code;
+  app.net = NET.OPENING;
+  if (!openLink(() => createHost(code, hostHandlers()))) return;
+  saveLastCode(code);
+  hostSync();
 }
 
 // --- Hosting ---------------------------------------------------------------
@@ -191,6 +217,7 @@ function reclaimCode() {
 function startP2P() {
   const code = generateRoomCode();
   engine.reset();
+  resetNameDrafts();
   engine.addPlayer(app.me.id, app.me.name || 'Player 1');
 
   app.mode = 'p2p';
@@ -212,6 +239,9 @@ function startP2P() {
   app.me.isHost = !serverConfigured();
   app.notice = '';
   app.net = NET.OPENING;
+  hostResumed = false;
+  codeRerolled = false;
+  reclaimAttempts = 0;
 
   if (!openLink(() => createHost(code, hostHandlers()))) return;
   saveLastCode(code);
@@ -220,7 +250,10 @@ function startP2P() {
 
 function hostHandlers() {
   return {
-    onOpen: () => setNet(guestIds.size ? NET.LIVE : NET.WAITING),
+    onOpen: () => {
+      reclaimAttempts = 0;
+      setNet(guestIds.size ? NET.LIVE : NET.WAITING);
+    },
     // Nothing happens on a bare connection. A channel that has not said hello
     // has no identity, so it cannot be seated and cannot act.
     onConnect: () => {},
@@ -239,10 +272,19 @@ function hostHandlers() {
     onBrokerUp: () => setNet(guestIds.size ? NET.LIVE : NET.WAITING),
     onBrokerLost: () => setNet(NET.LOST),
     onError: (err) => {
-      if (err && err.type === 'unavailable-id' && !idRetried && app.code) {
-        idRetried = true;
-        reclaimCode();
-        return;
+      if (err && err.type === 'unavailable-id' && app.code) {
+        if (hostResumed) {
+          if (reclaimAttempts < RECLAIM_DELAYS_MS.length) {
+            reclaimCode();
+            return;
+          }
+        } else if (!codeRerolled) {
+          rerollCode();
+          return;
+        }
+        // Out of retries: leave OPENING, which would otherwise hang forever.
+        if (link) { link.destroy(); link = null; }
+        app.net = NET.LOST;
       }
       app.notice = describePeerError(err);
       draw();
@@ -279,10 +321,17 @@ function seatGuest(connId, msg) {
   // peer could introduce itself twice and occupy both seats.
   const known = guestIds.get(connId);
   if (known && known !== id) return;
-  // And one channel per identity, so a peer cannot claim the seat someone
-  // else is already sitting in by guessing their clientId.
-  for (const [otherConn, otherId] of guestIds) {
-    if (otherId === id && otherConn !== connId) return;
+  // And one channel per identity, but the NEWEST one wins. A reloaded page
+  // gets a fresh peer id, and WebRTC can take many seconds (or forever) to
+  // notice the old channel died; refusing the newcomer would strand them with
+  // no game state. The clientId is 128 random bits only that browser holds, so
+  // someone presenting it is that player coming back, not an impostor.
+  for (const [otherConn, otherId] of [...guestIds]) {
+    if (otherId !== id || otherConn === connId) continue;
+    // Unmap BEFORE dropping: dropConnection fires onDisconnect, which must
+    // find no identity so it does not mark this returning player away.
+    guestIds.delete(otherConn);
+    link.dropConnection(otherConn);
   }
 
   const seated = engine.addPlayer(id, cleanName(raw) || 'Player 2');
@@ -307,6 +356,7 @@ function joinRoom(raw) {
   }
 
   engine.reset();
+  resetNameDrafts();
   app.mode = 'p2p';
   app.screen = 'lobby';
   app.code = code;
@@ -379,8 +429,13 @@ function onHostMessage(msg) {
 
     case 'refused': {
       const why = validNameField(msg.reason);
+      // Being refused leaves nothing to resume: no link, no state, and a saved
+      // session that would make a reload try the same door again. goHome()
+      // resets all of that (it is safe to hang up from inside this handler,
+      // since nothing below touches the link). It also clears app.notice, so
+      // the refusal text has to be set afterwards.
+      goHome();
       app.notice = why === 'full' ? 'That game is already full.' : (why || 'The host turned you away.');
-      dropLink();
       draw();
       return;
     }
@@ -460,6 +515,7 @@ function refreshThinking() {
 
 // --- Render loop -----------------------------------------------------------
 
+let drawing = false;     // true while render() is rebuilding #app
 let lastView = null;
 let lastMoveKey = null;
 
@@ -479,7 +535,60 @@ function moveKey() {
   return m ? `${app.pub.plies}:${m.cell}` : null;
 }
 
+// --- Deferred redraws -------------------------------------------------------
+//
+// draw() tears #app down and rebuilds it. Doing that at the wrong moment has
+// two costs. Inside a focused field's blur/change dispatch, Chrome throws
+// NotFoundError on removeChild. And between a button's mousedown and mouseup
+// the pressed button is replaced, so the browser never sees a click on it.
+// So a draw requested while a pointer is held, or from inside commitPlayerName,
+// is parked and run once, just after the gesture's click has been delivered.
+let pointerHeld = false;
+let deferDraws = false;
+let drawPending = false;
+let pendingTimer = null;
+let fallbackTimer = null;
+const DRAW_FALLBACK_MS = 500;
+
+function flushDraw() {
+  clearTimeout(pendingTimer);
+  clearTimeout(fallbackTimer);
+  pendingTimer = fallbackTimer = null;
+  if (!drawPending) return;
+  drawPending = false;
+  draw();
+}
+
+function releasePointer() {
+  if (!pointerHeld) return;
+  pointerHeld = false;
+  // A timeout, not a direct call: pointerup comes BEFORE click, and the click
+  // must land on the still-present button first.
+  if (drawPending) pendingTimer = setTimeout(flushDraw, 0);
+}
+
+// Capture phase on document so no handler's stopPropagation can hide the
+// release. Pointercancel and window blur cover gestures that never get a
+// pointerup; the fallback timer covers anything else, so drawing can't freeze.
+document.addEventListener('pointerdown', () => { pointerHeld = true; }, true);
+document.addEventListener('pointerup', releasePointer, true);
+document.addEventListener('pointercancel', releasePointer, true);
+window.addEventListener('blur', releasePointer);
+
 function draw() {
+  if (pointerHeld || deferDraws) {
+    drawPending = true;
+    if (!pendingTimer && !pointerHeld) pendingTimer = setTimeout(flushDraw, 0);
+    if (!fallbackTimer) fallbackTimer = setTimeout(() => { pointerHeld = false; flushDraw(); }, DRAW_FALLBACK_MS);
+    return;
+  }
+  drawNow();
+}
+
+function drawNow() {
+  // A draft belongs to a lobby name field. Leaving the lobby (game start, home)
+  // destroys the field without a blur, so the draft is dropped here as well.
+  if (app.screen !== 'lobby') resetNameDrafts();
   app.thinking = bots.isThinking(engine, Date.now());
 
   const view = viewKey();
@@ -503,8 +612,13 @@ function draw() {
   root.classList.toggle('rerender', sameView);
   root.classList.toggle('fresh-move', freshMove);
 
-  clear(root);
-  render(root, app, intents);
+  drawing = true;
+  try {
+    clear(root);
+    render(root, app, intents);
+  } finally {
+    drawing = false;
+  }
 
   if (focusKey) {
     const next = root.querySelector(`[data-focus="${CSS.escape(focusKey)}"]`);
@@ -558,6 +672,7 @@ function startBot() {
 function startLocal(mode, seat) {
   dropLink();
   engine.reset();
+  resetNameDrafts();
   seat();
   app.mode = mode;
   app.screen = 'lobby';
@@ -572,6 +687,7 @@ function startLocal(mode, seat) {
 
 function goHome() {
   engine.reset();
+  resetNameDrafts();
   clearSession();
   stopBotTick();
   bots.reset();
@@ -594,13 +710,72 @@ function goHome() {
 // Renaming goes through the dispatcher like everything else, so a guest's
 // change reaches the host and comes back in the next broadcast. The only part
 // that stays local is remembering the name for next time.
+//
+// Typing only updates a raw DRAFT. Cleaning every keystroke trims the trailing
+// space (so "John Smith" can't be typed left to right), snaps an emptied field
+// to "Black" mid-edit, and in p2p lets a slow echo from the host overwrite
+// characters typed since. The name is committed when typing pauses and again
+// on blur/Enter; ui.js renders the draft until then.
+const NAME_COMMIT_MS = 400;
+const nameTimers = {};
+
 function setPlayerName(playerId, raw) {
+  app.nameDrafts[playerId] = raw;
+  clearTimeout(nameTimers[playerId]);
+  nameTimers[playerId] = setTimeout(() => sendDraftName(playerId, false), NAME_COMMIT_MS);
+}
+
+// Sends the draft as a rename. Returns whether an intent went out (and so a
+// redraw is already on its way). `final` is false for the pause-in-typing
+// commit, which leaves an empty field alone: "Black" is the fallback for a
+// field that was left empty, not for one being rewritten.
+function sendDraftName(playerId, final) {
+  const raw = app.nameDrafts[playerId];
+  if (raw === undefined) return false;
   const name = cleanName(raw);
+  if (!final && !name) return false;
+  const current = app.pub && app.pub.players.find((p) => p.id === playerId);
+  if (current && current.name === name) return false;
+  // On the final commit the draft goes BEFORE the intent: sendIntent redraws
+  // synchronously on the host, and that redraw must show the engine's name.
+  if (final) delete app.nameDrafts[playerId];
   if (playerId === app.me.id) {
     app.me.name = name;
     saveName(name);
   }
   sendIntent({ type: 'setName', playerId, name });
+  return true;
+}
+
+// Blur or Enter: the edit is over, so commit, drop the draft, and redraw so
+// the field shows the engine's cleaned name (trimmed, or the fallback).
+function commitPlayerName(playerId) {
+  // Chrome fires change on a focused, edited field the moment draw() tears it
+  // out of the DOM. That is a rebuild, not the person finishing: committing
+  // then would redraw in the middle of the teardown (and throw), and the draft
+  // has to survive for the replacement field anyway.
+  if (drawing) return;
+  clearTimeout(nameTimers[playerId]);
+  // This runs inside the field's change/blur dispatch, where a rebuild throws,
+  // and often between a button's mousedown and click, where it would eat the
+  // click. The intent still applies to the engine right here (so the clicked
+  // button's handler sees the new name); only the repaint is deferred.
+  deferDraws = true;
+  try {
+    const sent = sendDraftName(playerId, true);
+    delete app.nameDrafts[playerId];
+    // No intent means nothing redrew; a guest's redraw waits for the host's
+    // echo and would flash the old name meanwhile, so it repaints from the
+    // draft's cleaned form only when nothing was sent.
+    if (!sent) draw();
+  } finally {
+    deferDraws = false;
+  }
+}
+
+function resetNameDrafts() {
+  for (const id of Object.keys(nameTimers)) clearTimeout(nameTimers[id]);
+  app.nameDrafts = {};
 }
 
 const intents = {
@@ -611,6 +786,7 @@ const intents = {
   startP2P,
   joinRoom,
   setPlayerName,
+  commitPlayerName,
   setJoinCode(raw) {
     app.joinCode = normalizeCode(raw);
     // Redraws even when the value did not change, which is the case that
@@ -714,6 +890,9 @@ function resumeP2P(session) {
   app.me.isOwner = true;
   app.me.isHost = !serverConfigured();   // same branch as startP2P
   app.net = NET.OPENING;
+  hostResumed = true;
+  codeRerolled = false;
+  reclaimAttempts = 0;
   app.pub = engine.publicState();
   lastMoveKey = moveKey();
 

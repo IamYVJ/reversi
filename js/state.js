@@ -48,6 +48,83 @@ function fail(error) {
 
 const OK = Object.freeze({ ok: true });
 
+// --- restore() validators ---------------------------------------------------
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const isSeat = (v) => v === BLACK || v === WHITE;
+const count = (v) => (Number.isInteger(v) && v >= 0 ? v : 0);
+
+// Rebuilds the typed array, and defends the length: a snapshot written under a
+// different board size (or a truncated one) would otherwise leave every
+// row-major index pointing at the wrong square.
+function restoreBoard(cells, size) {
+  const board = openingBoard(size);
+  if (!Array.isArray(cells) || cells.length !== board.length) return board;
+  for (let i = 0; i < board.length; i++) {
+    const v = cells[i];
+    board[i] = isSeat(v) ? v : EMPTY;
+  }
+  return board;
+}
+
+// Malformed entries are dropped rather than repaired, and so are later
+// duplicates of an id or a seat: two players sharing either would make
+// playerById/playerBySeat ambiguous.
+function restorePlayers(raw) {
+  const players = [];
+  if (!Array.isArray(raw)) return players;
+  for (const p of raw) {
+    if (players.length >= MAX_PLAYERS) break;
+    if (!isPlainObject(p) || typeof p.id !== 'string' || !p.id || !isSeat(p.seat)) continue;
+    if (players.some((q) => q.id === p.id || q.seat === p.seat)) continue;
+    const isBot = p.isBot === true;
+    players.push({
+      id: p.id,
+      name: cleanName(p.name) || (isBot ? 'Bot' : 'Player'),
+      isBot,
+      botLevel: isBot ? botLevelFor(p.botLevel) : null,
+      seat: p.seat,
+      connected: typeof p.connected === 'boolean' ? p.connected : true,
+    });
+  }
+  return players;
+}
+
+// The owner holds the controls, so a bot or an unknown id cannot be one.
+function restoreOwner(id, players) {
+  if (id === null || id === undefined) return null;
+  const named = typeof id === 'string' && players.find((p) => p.id === id && !p.isBot);
+  if (named) return id;
+  const first = players.find((p) => !p.isBot);
+  return first ? first.id : null;
+}
+
+function validCellIndex(v, size) {
+  return Number.isInteger(v) && v >= 0 && v < cellCount(size);
+}
+
+function restoreLastMove(m, size) {
+  if (!isPlainObject(m) || !validCellIndex(m.cell, size) || !isSeat(m.player)) return null;
+  if (!Array.isArray(m.flips) || !m.flips.every((c) => validCellIndex(c, size))) return null;
+  return { cell: m.cell, player: m.player, flips: [...m.flips] };
+}
+
+// Keeps the LAST entries, matching what _log trims to.
+function restoreLog(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e) => isPlainObject(e) && typeof e.text === 'string')
+    .map((e) => ({ text: e.text, seat: isSeat(e.seat) ? e.seat : null }))
+    .slice(-LOG_LIMIT);
+}
+
+function restoreScore(s) {
+  if (!isPlainObject(s)) return null;
+  const { black, white, empty } = s;
+  if (![black, white, empty].every((n) => Number.isInteger(n) && n >= 0)) return null;
+  return { black, white, empty };
+}
+
 export class GameEngine {
   constructor() {
     this.reset();
@@ -71,6 +148,10 @@ export class GameEngine {
     this.log = [];
     this.winner = null;     // BLACK | WHITE | DRAW
     this.finalScore = null;
+    // True when the owner stopped the game rather than the rules ending it.
+    // The winner is still computed from the discs so the record stays
+    // meaningful, but every surface must not call it a win.
+    this.endedEarly = false;
     this.gamesPlayed = 0;
     // Which colour the first-listed player took this game. Flipped by
     // playAgain so a rematch does not hand the same person black twice.
@@ -193,6 +274,10 @@ export class GameEngine {
   startGame() {
     if (this.phase === PHASES.PLAY) return fail('Already playing.');
     if (this.players.length !== MAX_PLAYERS) return fail('Reversi needs exactly two players.');
+    // A seat held for a dropped guest is not an opponent: starting now would
+    // deal a game nobody is there to play.
+    const away = this._absentPlayer();
+    if (away) return fail(`Waiting for ${away.name} to reconnect.`);
 
     this.size = boardSizeFor(this.config);
     this.board = openingBoard(this.size);
@@ -202,6 +287,7 @@ export class GameEngine {
     this.lastPass = null;
     this.winner = null;
     this.finalScore = null;
+    this.endedEarly = false;
     this.log = [];
     this.phase = PHASES.PLAY;
     this._log(`${this.seatName(BLACK)} opens.`, BLACK);
@@ -275,30 +361,60 @@ export class GameEngine {
     this.phase = PHASES.GAME_OVER;
     this.gamesPlayed++;
     this.lastPass = null;
-    this._log(
-      winner === DRAW
+    const lead = winner === BLACK ? black : white;
+    const trail = winner === BLACK ? white : black;
+    // The winner's count comes first. Under Anti-Othello the winner has the
+    // FEWER discs, so "larger first" would read as the loser's score.
+    let text;
+    if (this.endedEarly) {
+      // Not "wins": nobody finished the game, so only say who led.
+      text = winner === DRAW
+        ? `Game ended early, level at ${black}-${white}.`
+        : `Game ended early. ${this.seatName(winner)} led, ${lead}-${trail}.`;
+    } else {
+      text = winner === DRAW
         ? `Drawn, ${black}-${white}.`
-        : `${this.seatName(winner)} wins ${Math.max(black, white)}-${Math.min(black, white)}.`,
-      winner === DRAW ? null : winner,
-    );
+        : `${this.seatName(winner)} wins ${lead}-${trail}.`;
+    }
+    this._log(text, winner === DRAW ? null : winner);
   }
 
   // Owner escape hatch: ends a game that is running. Distinct from _finish,
   // which is the rules deciding the game is over.
   endGame() {
     if (this.phase !== PHASES.PLAY) return fail('Nothing to end.');
+    this.endedEarly = true;
     this._finish();
     return OK;
   }
 
   playAgain() {
     if (this.phase !== PHASES.GAME_OVER) return fail('Finish this game first.');
+    // Checked before the colours swap: startGame would refuse too, but by then
+    // the seats would already have flipped under a rematch that never began.
+    const away = this._absentPlayer();
+    if (away) return fail(`Waiting for ${away.name} to reconnect.`);
     for (const p of this.players) p.seat = opponent(p.seat);
     this.startSeat = opponent(this.startSeat);
     return this.startGame();
   }
 
+  // A player whose connection dropped mid-game, kept seated so a reconnect
+  // lands back in the same colour. Bots never disconnect, so they never match.
+  _absentPlayer() {
+    return this.players.find((p) => p.connected === false) || null;
+  }
+
   backToLobby() {
+    // Seats held for absent players only make sense while a game is on. Back in
+    // the lobby they would block the room ("This game is full.") and let a game
+    // start against nobody, so release them.
+    const owner = this.ownerId;
+    this.players = this.players.filter((p) => p.connected !== false);
+    if (owner && !this.playerById(owner)) {
+      const heir = this.players.find((p) => !p.isBot);
+      this.ownerId = heir ? heir.id : null;
+    }
     this.phase = PHASES.LOBBY;
     this.size = boardSizeFor(this.config);
     this.board = openingBoard(this.size);
@@ -308,6 +424,7 @@ export class GameEngine {
     this.lastPass = null;
     this.winner = null;
     this.finalScore = null;
+    this.endedEarly = false;
     this.log = [];
     return OK;
   }
@@ -354,30 +471,57 @@ export class GameEngine {
       log: this.log.map((e) => ({ ...e })),
       winner: this.winner,
       finalScore: this.finalScore ? { ...this.finalScore } : null,
+      endedEarly: this.endedEarly,
       gamesPlayed: this.gamesPlayed,
       startSeat: this.startSeat,
     };
   }
 
+  // Copies ONLY the fields serialize() writes, each validated, and falls back to
+  // the reset() default for anything malformed. A blanket Object.assign would let
+  // a corrupt or stale localStorage entry overwrite methods (`playMove: 'x'`) or
+  // hit the __proto__ setter, and a snapshot that bricks the engine on every
+  // reload is worse than one that quietly loses a field.
   restore(snapshot) {
     this.reset();
-    if (!snapshot || typeof snapshot !== 'object') return this;
-    Object.assign(this, snapshot);
-    this.config = normalizeConfig(this.config);
+    if (!isPlainObject(snapshot)) return this;
+
+    this.config = normalizeConfig(snapshot.config);
     this.size = boardSizeFor(this.config);
-    // Rebuild the typed array, and defend the length: a snapshot written under
-    // a different board size (or a truncated one) would otherwise leave every
-    // row-major index pointing at the wrong square.
-    const cells = Array.isArray(snapshot.board) ? snapshot.board : [];
-    const board = openingBoard(this.size);
-    if (cells.length === board.length) {
-      for (let i = 0; i < board.length; i++) {
-        const v = cells[i];
-        board[i] = v === BLACK || v === WHITE ? v : EMPTY;
-      }
+    this.board = restoreBoard(snapshot.board, this.size);
+
+    this.players = restorePlayers(snapshot.players);
+    this.ownerId = restoreOwner(snapshot.ownerId, this.players);
+    this.turn = snapshot.turn === WHITE ? WHITE : BLACK;
+    this.startSeat = snapshot.startSeat === WHITE ? WHITE : BLACK;
+    this.plies = count(snapshot.plies);
+    this.gamesPlayed = count(snapshot.gamesPlayed);
+    this.lastMove = restoreLastMove(snapshot.lastMove, this.size);
+    this.lastPass = isPlainObject(snapshot.lastPass) && isSeat(snapshot.lastPass.player)
+      ? { player: snapshot.lastPass.player } : null;
+    this.log = restoreLog(snapshot.log);
+    this.winner = snapshot.winner === DRAW || isSeat(snapshot.winner) ? snapshot.winner : null;
+    this.finalScore = restoreScore(snapshot.finalScore);
+    this.endedEarly = snapshot.endedEarly === true;
+
+    const phase = Object.values(PHASES).includes(snapshot.phase) ? snapshot.phase : PHASES.LOBBY;
+    if (phase !== PHASES.LOBBY && this.players.length !== MAX_PLAYERS) {
+      // A game cannot be resumed without both seats, so drop back to a lobby
+      // with a fresh opening board. Whoever did restore stays seated, which
+      // keeps resumeLocal/resumeP2P (they bail only on an empty player list)
+      // landing in a usable lobby instead of the home screen.
+      this.board = openingBoard(this.size);
+      this.turn = BLACK;
+      this.plies = 0;
+      this.lastMove = null;
+      this.lastPass = null;
+      this.winner = null;
+      this.finalScore = null;
+      this.endedEarly = false;
+      this.phase = PHASES.LOBBY;
+    } else {
+      this.phase = phase;
     }
-    this.board = board;
-    this.turn = this.turn === WHITE ? WHITE : BLACK;
     return this;
   }
 
@@ -398,6 +542,7 @@ export class GameEngine {
       log: this.log.map((e) => ({ ...e })),
       winner: this.winner,
       finalScore: this.finalScore ? { ...this.finalScore } : null,
+      endedEarly: this.endedEarly,
       score: this.score(),
       gamesPlayed: this.gamesPlayed,
     };

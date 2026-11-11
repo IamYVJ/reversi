@@ -212,7 +212,10 @@ export function createHost(code, handlers = {}) {
     // It is deliberately larger than the two seats this game has: a player
     // reloading mid-game is briefly present twice, and refusing them their own
     // seat back would be a worse bug than holding a spare slot.
-    if (connections.size >= MAX_CONNECTIONS) {
+    // A re-dial from a peer id we already hold REPLACES its entry rather than
+    // adding one, so it must not be counted against the cap: refusing a player
+    // their own seat back is exactly what the allowance above exists to avoid.
+    if (!connections.has(conn.peer) && connections.size >= MAX_CONNECTIONS) {
       handlers.onFull && handlers.onFull(conn.peer);
       // Tell them why before hanging up. This one IS answered, unlike a
       // malformed frame: a guest at the cap is almost certainly a real person
@@ -226,11 +229,29 @@ export function createHost(code, handlers = {}) {
 
     const connId = conn.peer;
     const entry = { conn, bucket: new TokenBucket(), refused: 0 };
+    // The same guest dialling again (a reload, or joinHost retrying with the
+    // one Peer object it reuses) arrives under an id we already hold. Swap the
+    // entry in FIRST, then hang up the old channel: its close event may fire
+    // synchronously or minutes late, and either way the identity checks below
+    // see it is no longer current. onDisconnect is deliberately NOT fired for
+    // it — it is the same player on a fresh channel, and the app's hello path
+    // re-seats them; reporting them gone would mark them away and stop
+    // broadcasts reaching the live connection.
+    const previous = connections.get(connId);
     connections.set(connId, entry);
+    if (previous) {
+      try { previous.conn.close(); } catch (_) { /* already gone */ }
+    }
+    const isCurrent = () => connections.get(connId) === entry;
 
-    conn.on('open', () => { handlers.onConnect && handlers.onConnect(connId); });
+    conn.on('open', () => {
+      if (!isCurrent()) return;
+      handlers.onConnect && handlers.onConnect(connId);
+    });
 
     conn.on('data', (raw) => {
+      // A superseded channel can still deliver frames before it finishes closing.
+      if (!isCurrent()) return;
       const msg = decodePeerFrame(raw, { maxBytes: MAX_FRAME_BYTES });
       // Silence is the right answer to junk. An error reply is a free oracle
       // for anyone probing what this endpoint accepts.
@@ -246,7 +267,9 @@ export function createHost(code, handlers = {}) {
     });
 
     const close = () => {
-      if (!connections.has(connId)) return;
+      // Only the CURRENT channel for this id may report a disconnect; a stale
+      // one closing late must not evict its replacement.
+      if (!isCurrent()) return;
       connections.delete(connId);
       handlers.onDisconnect && handlers.onDisconnect(connId);
     };

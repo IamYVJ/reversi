@@ -175,14 +175,17 @@ scripts/
   gen-icons.js          regenerates the PNG icons (node, no deps — a hand-rolled
                           PNG encoder over node:zlib)
   test-engine.mjs       headless tests — the rules, every board size, every
-                          toggle, hundreds of full bot games, the guards, reload
-                          recovery, and a check that sw.js still precaches every
-                          module the app actually imports
-package.json            npm test / npm run icons (no dependencies)
+                          toggle, full bot games, the guards, reload recovery,
+                          and a check that sw.js still precaches every module
+                          the app actually imports (--full for the long run)
+package.json            npm test / test:full / icons (no dependencies)
 ```
 
-`npm test` runs the whole suite in Node — no browser, no dependencies, no build
-step.
+`npm test` runs the suite in Node — no browser, no dependencies, no build
+step. It takes about a minute: every check runs, but the slow statistical ones
+(bot-versus-bot games, thousands of random playouts) use smaller samples.
+`npm run test:full` runs them at full size and takes the better part of fifteen
+minutes — worth doing before a release or after touching the bot or the rules.
 
 ---
 

@@ -56,10 +56,18 @@ const WIN_SCORE = 1e6;
 const DEPTH_BONUS = 1000;
 
 // What one point of mobility advantage is worth against one point of
-// positional value. Mobility dominates for most of the game — a player with no
-// good moves is forced to wreck their own position — so this is deliberately
-// large. It stops the bot trading its whole structure for a few extra discs.
-const MOBILITY_WEIGHT = 12;
+// positional value, as a range: the weight slides linearly with how empty the
+// board is, from OPENING on a fresh board down to ENDGAME on a full one.
+//
+// Early on mobility dominates — a player with no good moves is forced to wreck
+// their own position — so the opening weight is deliberately large. It stops
+// the bot trading its whole structure for a few extra discs. But the same
+// weight late in the game is a trap: mobility is normalised to +-100, so at 12
+// it can swing +-1200 against a corner's +100 and the bot will give up a corner
+// (which can never be flipped back) for a sliver of mobility. Late on, corners
+// and stable discs decide the game, so the weight is allowed to fall.
+const MOBILITY_OPENING = 12;
+const MOBILITY_ENDGAME = 4;
 
 // Disc count barely matters until the board is nearly full, because anything
 // can flip back. Weighted near zero and left in only so that two otherwise
@@ -132,6 +140,11 @@ function greedyPick(moves, anti) {
   return shuffle(tied)[0].cell;
 }
 
+// Scores are floats (mobility is a fraction), so "tied" needs a tolerance
+// far smaller than any real difference between positions, yet far above
+// float rounding at WIN_SCORE magnitudes (~1e-10).
+const TIE_EPS = 1e-6;
+
 /**
  * Medium and Hard: alpha-beta, widened one ply at a time.
  *
@@ -155,7 +168,15 @@ function searchBest(board, player, size, ctx) {
 
     for (const cell of order) {
       const next = applyTo(board, cell, player, size, moves.get(cell));
-      const score = -negamax(next, opponent(player), size, depth - 1, -Infinity, -alpha, state);
+      // The window's far edge sits EPS above -alpha, not exactly on it. With
+      // beta = -alpha a move that merely TIES the best so far is cut off and
+      // comes back as a bound ("no better than alpha") that is numerically
+      // equal to alpha — indistinguishable from an exact tie, and Reversi
+      // transposes enough that this happens constantly. The shuffle below
+      // would then pick a refuted move. Widening by EPS makes a true tie
+      // search to an exact value, while anything genuinely worse still fails
+      // low to a bound strictly under alpha - so it can never join the tie.
+      const score = -negamax(next, opponent(player), size, depth - 1, -Infinity, -alpha + TIE_EPS, state);
       if (state.out) break;
       ranked.push({ cell, score });
       if (score > alpha) alpha = score;
@@ -174,6 +195,25 @@ function searchBest(board, player, size, ctx) {
   }
 
   return chosen;
+}
+
+/**
+ * Test hook: the exact full-window value of every root move at `depth`, as
+ * { cell: score } from the mover's point of view. Lets a test check that
+ * chooseMove's pick is truly optimal without duplicating the evaluator.
+ */
+export function rootScores(board, player, config = {}, depth = DEPTHS.medium) {
+  const size = boardSizeFor(config);
+  const state = {
+    weights: weightsFor(size), size, anti: antiOthelloOn(config),
+    deadline: Infinity, clock: Date.now, nodes: 0, out: false,
+  };
+  const out = new Map();
+  for (const [cell, flips] of legalMoveMap(board, player, size)) {
+    const next = applyTo(board, cell, player, size, flips);
+    out.set(cell, -negamax(next, opponent(player), size, depth - 1, -Infinity, Infinity, state));
+  }
+  return out;
 }
 
 /**
@@ -289,7 +329,13 @@ function evaluate(board, player, size, state, myMoves) {
 
   const discs = anti ? theirs - mine : mine - theirs;
 
-  return positional + MOBILITY_WEIGHT * mobility + DISC_WEIGHT * discs;
+  // Empties come free from the counts above. Interpolated rather than stepped
+  // so the evaluation has no cliff for the search to dive off at some depth.
+  const emptyFraction = (board.length - mine - theirs) / board.length;
+  const mobilityWeight = MOBILITY_ENDGAME
+    + (MOBILITY_OPENING - MOBILITY_ENDGAME) * emptyFraction;
+
+  return positional + mobilityWeight * mobility + DISC_WEIGHT * discs;
 }
 
 // ===========================================================================
@@ -318,10 +364,13 @@ export const BOT_THINK_MS = 600;
 export function createBotDriver({ thinkMs = BOT_THINK_MS, budgetMs = SEARCH_BUDGET_MS } = {}) {
   let pending = null;
 
-  // Identifies one bot turn. Keyed on plies, which only ever increases. A pass
-  // does not advance it, but a pass also cannot leave the same bot to move
-  // twice in a row — the engine only passes when the OTHER side has a move —
-  // so the key cannot go stale mid-turn.
+  // Identifies one bot turn. Keyed on plies, which only ever increases: every
+  // completed move increments it. A pass does not advance it, and a pass CAN
+  // leave the same bot to move twice in a row (the human has no legal move, so
+  // the engine skips them). That is still safe: the bot's second consecutive
+  // turn comes after its first move, which bumped plies, so the two turns get
+  // different keys. A pass alone never hands the turn over without a move in
+  // between, so the key cannot go stale mid-turn.
   function turnKey(engine) {
     const player = engine.currentPlayer;
     if (!player || !player.isBot) return null;

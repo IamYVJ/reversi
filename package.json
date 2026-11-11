@@ -6,6 +6,7 @@
   "description": "Static browser implementation of Reversi (Othello) — hotseat, peer-to-peer, or against a bot.",
   "scripts": {
     "test": "node scripts/test-engine.mjs",
+    "test:full": "node scripts/test-engine.mjs --full",
     "icons": "node scripts/gen-icons.js",
     "serve": "python -m http.server 8000"
   },

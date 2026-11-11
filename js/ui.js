@@ -212,8 +212,10 @@ function lobbyScreen(app, intents) {
       type: 'button',
       // Reversi needs exactly two. The engine refuses a short table anyway;
       // this is so the owner is not invited to press a button that cannot work
-      // while they are still waiting for someone to arrive.
-      disabled: !app.me.isOwner || pub.players.length !== 2,
+      // while they are still waiting for someone to arrive. Same for a player
+      // who has dropped and not yet reconnected.
+      disabled: !app.me.isOwner || pub.players.length !== 2
+        || pub.players.some((p) => p.connected === false),
       'data-focus': 'start-game',
       onClick: () => {
         intents.send({ type: 'startGame' });
@@ -238,11 +240,17 @@ function seatRow(player, app, intents) {
       ? el('input', {
         class: 'name-input',
         type: 'text',
-        value: player.name,
+        // A draft, while there is one, is what the person has actually typed
+        // and wins over the engine's cleaned-up copy: otherwise the rebuild
+        // would swallow a trailing space or put "Black" back mid-edit.
+        value: app.nameDrafts && app.nameDrafts[player.id] !== undefined
+          ? app.nameDrafts[player.id] : player.name,
         maxlength: '20',
         'aria-label': `${player.seat === BLACK ? 'Black' : 'White'} player name`,
         'data-focus': `name-${player.id}`,
         onInput: (e) => intents.setPlayerName(player.id, e.target.value),
+        onChange: () => intents.commitPlayerName(player.id),
+        onKeydown: (e) => { if (e.key === 'Enter') e.target.blur(); },
       })
       : el('span', { class: 'seat-name' },
         player.isBot ? `${player.name} · ${nameFor(player.botLevel)}` : player.name),
@@ -367,7 +375,7 @@ function gameScreen(app, intents) {
     scoreboard(pub),
     over ? resultBanner(pub) : turnBanner(app, pub),
     boardGrid({ app, intents, pub, board, legal, over }),
-    over ? resultActions(app, intents) : null,
+    over ? resultActions(app, intents) : endGameAction(app, intents),
     moveLog(pub),
   );
 }
@@ -388,9 +396,15 @@ function canAct(app, pub) {
 function announcement(pub) {
   if (pub.phase === PHASES.GAME_OVER) {
     const { black, white } = pub.finalScore || pub.score;
+    if (pub.endedEarly) {
+      return pub.winner === DRAW
+        ? `Game ended early. Level, ${black} to ${white}.`
+        : `Game ended early. ${seatLabel(pub, pub.winner)} led, ${pub.winner === BLACK ? black : white} to ${pub.winner === BLACK ? white : black}.`;
+    }
     if (pub.winner === DRAW) return `Game over. Drawn, ${black} to ${white}.`;
     const name = pub.players.find((p) => p.seat === pub.winner);
-    return `Game over. ${name ? name.name : colourWord(pub.winner)} wins, ${Math.max(black, white)} to ${Math.min(black, white)}.`;
+    // Winner's count first: under Anti-Othello that is the smaller number.
+    return `Game over. ${name ? name.name : colourWord(pub.winner)} wins, ${pub.winner === BLACK ? black : white} to ${pub.winner === BLACK ? white : black}.`;
   }
   const parts = [];
   if (pub.lastMove) {
@@ -445,6 +459,17 @@ function turnBanner(app, pub) {
 function resultBanner(pub) {
   const { black, white, empty } = pub.finalScore || { ...pub.score, empty: 0 };
   const drawn = pub.winner === DRAW;
+  if (pub.endedEarly) {
+    // The no-legal-move note below would be false here, so it is skipped.
+    return el('div', { class: 'banner banner-result' },
+      el('p', { class: 'result-line' }, 'Game ended early'),
+      el('p', { class: 'result-note' },
+        drawn ? 'Level' : `${seatLabel(pub, pub.winner)} led`),
+      el('p', { class: 'result-score' },
+        drawn ? `${black} – ${white}`
+          : `${pub.winner === BLACK ? black : white} – ${pub.winner === BLACK ? white : black}`),
+    );
+  }
   return el('div', { class: 'banner banner-result' },
     el('p', { class: 'result-line' },
       drawn ? 'Drawn game' : `${seatLabel(pub, pub.winner)} wins`),
@@ -456,6 +481,22 @@ function resultBanner(pub) {
       ? el('p', { class: 'result-note' },
         `Neither player had a legal move with ${empty} ${empty === 1 ? 'square' : 'squares'} still empty.`)
       : null,
+  );
+}
+
+// Owner-only escape hatch while a game is running. A guest never sees it: the
+// engine would refuse their intent anyway, and a dead button is worse than none.
+function endGameAction(app, intents) {
+  if (!app.me.isOwner) return null;
+  return el('div', { class: 'action-row' },
+    el('button', {
+      class: 'btn btn-ghost', type: 'button', 'data-focus': 'end-game',
+      onClick: () => {
+        if (window.confirm('End this game now? The result will be recorded as ended early.')) {
+          intents.send({ type: 'endGame' });
+        }
+      },
+    }, 'End game'),
   );
 }
 
@@ -605,14 +646,35 @@ const ARROWS = {
   ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1],
 };
 
+// Home/End jump to the row's ends; with Ctrl (Cmd on Mac, which has no Home/End
+// keys of its own and reaches them through Cmd+arrows) they jump to the board's
+// corners. This is the WAI-ARIA grid pattern. Returns the target [row, col], or
+// null when the key is not a grid-navigation key so it falls through untouched.
+function keyTarget(event, from, size) {
+  const row = rowOf(from, size);
+  const col = colOf(from, size);
+  const whole = event.ctrlKey || event.metaKey;
+  const last = size - 1;
+  switch (event.key) {
+    case 'Home': return [whole ? 0 : row, 0];
+    case 'End': return [whole ? last : row, last];
+    default: {
+      const step = ARROWS[event.key];
+      if (!step) return null;
+      return [
+        Math.min(last, Math.max(0, row + step[0])),
+        Math.min(last, Math.max(0, col + step[1])),
+      ];
+    }
+  }
+}
+
 function onBoardKey(event, size) {
-  const step = ARROWS[event.key];
-  if (!step) return;
-  event.preventDefault();
   const from = cursor === null ? 0 : cursor;
-  const row = Math.min(size - 1, Math.max(0, rowOf(from, size) + step[0]));
-  const col = Math.min(size - 1, Math.max(0, colOf(from, size) + step[1]));
-  const target = cellAt(row, col, size);
+  const dest = keyTarget(event, from, size);
+  if (!dest) return;
+  event.preventDefault();
+  const target = cellAt(dest[0], dest[1], size);
   if (target === from) return;
   cursor = target;
   const node = event.currentTarget.querySelector(`[data-cell="${target}"]`);

@@ -19,7 +19,7 @@ import {
 } from '../js/rules.js';
 import { GameEngine, PHASES, DRAW, boardFrom } from '../js/state.js';
 import { applyGameIntent, GAME_INTENTS, PLAYER_INTENTS, OWNER_INTENTS } from '../js/intents.js';
-import { chooseMove, createBotDriver, BOT_THINK_MS, SEARCH_BUDGET_MS } from '../js/bot.js';
+import { chooseMove, rootScores, createBotDriver, BOT_THINK_MS, SEARCH_BUDGET_MS } from '../js/bot.js';
 import {
   validEnvelope, validCell, validConfigPatch, validClientId, validNameField,
   validPublicState, decodePeerFrame, TokenBucket,
@@ -35,7 +35,7 @@ import {
   saveSession, loadSession, clearSession, saveEngineSnapshot, loadEngineSnapshot,
 } from '../js/util.js';
 import {
-  PEER_PREFIX, peerIdForCode, codeFromPeerId, isFatalPeerError, describePeerError,
+  PEER_PREFIX, peerIdForCode, codeFromPeerId, isFatalPeerError, describePeerError, createHost,
 } from '../js/net.js';
 import {
   SERVER_URL, SERVER_HEALTH, serverConfigured, HEALTH_TIMEOUT_MS, HEALTH_RETRIES,
@@ -55,7 +55,28 @@ function eq(actual, expected, msg) {
   ok(actual === expected, `${msg} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
 }
 
-function section(t) { console.log('\n- ' + t); }
+// Full mode runs the slow statistical sections at their real size; the default
+// run shrinks them so `npm test` stays a quick pre-commit check. See the
+// `pick(fast, full)` call sites — everything else is identical in both modes.
+const FULL = process.argv.includes('--full') || process.env.TEST_FULL === '1';
+const pick = (fast, full) => (FULL ? full : fast);
+
+// Each section header also reports how long the PREVIOUS one took, so a slow
+// section shows up in the output instead of having to be hunted for.
+let sectionName = null;
+let sectionStart = 0;
+function endSection() {
+  if (sectionName === null) return;
+  const ms = Date.now() - sectionStart;
+  if (ms >= 1000) console.log(`  (${sectionName}: ${(ms / 1000).toFixed(1)}s)`);
+}
+function section(t) {
+  endSection();
+  console.log('\n- ' + t);
+  sectionName = t;
+  sectionStart = Date.now();
+}
+console.log(`mode: ${FULL ? 'full' : 'fast (pass --full or TEST_FULL=1 for the whole suite)'}`);
 
 // Deterministic RNG. rules.js reads `crypto` at CALL time, so swapping the
 // global here — before any engine exists — is enough to pin every shuffle and
@@ -376,6 +397,21 @@ section('anti-othello');
   const antiDraw = twoPlayerGame({ size: 6, turn: BLACK, rows: drawRows, antiOthello: true });
   antiDraw.playMove('p-black', cellAt(0, 0, 6));
   eq(antiDraw.winner, DRAW, 'Anti-Othello does not turn a draw into a win');
+
+  // The result line leads with the WINNER's count. Under Anti-Othello that is
+  // the smaller number, so "larger first" would read as the loser's score.
+  const fullRows = (blackRows) => Array.from({ length: 8 }, (_, r) => (r < blackRows ? 'B' : 'W').repeat(8));
+  const lastLine = (e) => e.log[e.log.length - 1].text;
+
+  const normalEnd = twoPlayerGame({ size: 8, rows: fullRows(5) });
+  normalEnd._finish();
+  eq(normalEnd.winner, BLACK, 'black holding 40 of 64 wins normally');
+  ok(/wins 40-24\.$/.test(lastLine(normalEnd)), `normal result line leads with the winner's 40 (${lastLine(normalEnd)})`);
+
+  const antiEnd = twoPlayerGame({ size: 8, rows: fullRows(3), antiOthello: true });
+  antiEnd._finish();
+  eq(antiEnd.winner, BLACK, 'black holding 24 of 64 wins under Anti-Othello');
+  ok(/wins 24-40\.$/.test(lastLine(antiEnd)), `anti result line leads with the winner's 24 (${lastLine(antiEnd)})`);
 }
 
 // --- Engine plumbing -------------------------------------------------------
@@ -433,6 +469,42 @@ section('lobby');
   eq(engine.playerById('b').connected, true, 'reconnected');
 }
 
+section('ending a game early');
+{
+  // Black 3 discs vs white 1: black is ahead.
+  const lead = twoPlayerGame({
+    size: 6, turn: BLACK,
+    rows: ['......', '......', '..WBB.', '...B..', '......', '......'],
+  });
+  eq(lead.endedEarly, false, 'a fresh game is not ended early');
+  ok(lead.endGame().ok, 'the owner can end a running game');
+  eq(lead.endedEarly, true, 'flagged as ended early');
+  eq(lead.phase, PHASES.GAME_OVER, 'game over');
+  eq(lead.winner, BLACK, 'the leader is still recorded');
+  const text = lead.log[lead.log.length - 1].text;
+  ok(/^Game ended early\. .+ led, 3-1\.$/.test(text), `log names the leader, leader's count first (${text})`);
+  ok(!/wins/.test(text), 'and does not call it a win');
+  eq(new GameEngine().restore(JSON.parse(JSON.stringify(lead.serialize()))).endedEarly, true, 'serialize/restore round-trips it');
+  eq(lead.publicState().endedEarly, true, 'publicState carries it');
+  ok(validPublicState(JSON.parse(JSON.stringify(lead.publicState()))) !== null, 'validPublicState accepts it');
+  eq(validPublicState({ ...lead.publicState(), endedEarly: 'yes' }), null, 'but not a non-boolean');
+  ok(validPublicState((() => { const p = lead.publicState(); delete p.endedEarly; return p; })()) !== null, 'or its absence');
+  ok(lead.playAgain().ok, 'a rematch starts');
+  eq(lead.endedEarly, false, 'and clears it');
+  lead.endGame();
+  lead.backToLobby();
+  eq(lead.endedEarly, false, 'back to lobby clears it too');
+
+  const level = twoPlayerGame({
+    size: 6, turn: BLACK,
+    rows: ['......', '......', '..WB..', '......', '......', '......'],
+  });
+  level.endGame();
+  ok(/^Game ended early, level at 1-1\.$/.test(level.log[level.log.length - 1].text), 'a tie reads as level');
+  eq(level.winner, DRAW, 'recorded as a draw');
+  ok(!level.endGame().ok, 'nothing to end once over');
+}
+
 section('serialize / restore');
 {
   seed(11);
@@ -467,6 +539,93 @@ section('serialize / restore');
   ok(new GameEngine().restore(null) instanceof GameEngine, 'restoring nothing is survivable');
 }
 
+section('restore only trusts what serialize writes');
+{
+  const rt = (e) => JSON.parse(JSON.stringify(e.serialize()));
+  const midGame = () => {
+    seed(23);
+    const e = twoPlayerGame({ size: 8 });
+    for (let i = 0; i < 7; i++) {
+      const cells = [...e.legalMoves().keys()];
+      e.playMove(e.currentPlayer.id, cells[randomBelow(cells.length)]);
+    }
+    return e;
+  };
+
+  // (1) A real mid-game snapshot comes back byte-for-byte.
+  const live = midGame();
+  const snap = rt(live);
+  eq(JSON.stringify(new GameEngine().restore(snap).serialize()), JSON.stringify(live.serialize()),
+    'a mid-game snapshot round-trips exactly');
+  ok(snap.lastMove && snap.log.length > 0, 'and the round-trip really covered a last move and a log');
+
+  // (2) Junk must not reach methods, the phase, or the prototype chain.
+  const protoBefore = Object.getPrototypeOf(new GameEngine());
+  const junk = JSON.parse('{"__proto__":{"polluted":1},"playMove":"x","phase":"nonsense","players":"oops","restore":1}');
+  const hardened = new GameEngine().restore(junk);
+  eq(typeof hardened.playMove, 'function', 'a snapshot cannot overwrite playMove');
+  eq(typeof hardened.restore, 'function', 'nor restore itself');
+  eq(hardened.phase, PHASES.LOBBY, 'an unknown phase falls back to the lobby');
+  eq(JSON.stringify(hardened.players), '[]', 'a non-array player list falls back to none');
+  eq(({}).polluted, undefined, '__proto__ does not pollute Object');
+  eq(hardened.polluted, undefined, 'nor the engine');
+  ok(Object.getPrototypeOf(hardened) === protoBefore, 'and the engine prototype is unchanged');
+  ok(hardened.addPlayer('x', 'X').ok, 'the engine is still usable afterwards');
+
+  // (3) Each malformed field falls back on its own, leaving the rest intact.
+  const bad = (patch) => new GameEngine().restore({ ...snap, ...patch });
+  eq(bad({ lastMove: { cell: 9999, player: BLACK, flips: [] } }).lastMove, null, 'an out-of-range lastMove cell is dropped');
+  eq(bad({ lastMove: { cell: 3, player: BLACK, flips: ['a'] } }).lastMove, null, 'non-integer flips drop lastMove');
+  eq(bad({ lastMove: 'x' }).lastMove, null, 'a non-object lastMove is dropped');
+  eq(bad({ lastPass: { player: 7 } }).lastPass, null, 'a lastPass with no real seat is dropped');
+  const logged = bad({ log: [{ text: 5, seat: BLACK }, { text: 'ok', seat: 'zzz' }, null, { text: 'fine', seat: WHITE }] }).log;
+  eq(JSON.stringify(logged), JSON.stringify([{ text: 'ok', seat: null }, { text: 'fine', seat: WHITE }]),
+    'log entries with non-string text are dropped and a bad seat becomes null');
+  const longLog = Array.from({ length: 40 }, (_, i) => ({ text: 'm' + i, seat: null }));
+  const trimmed = bad({ log: longLog }).log;
+  ok(trimmed.length <= 14 && trimmed[trimmed.length - 1].text === 'm39', 'an oversized log keeps only the latest entries');
+  const dupSeat = bad({ players: [snap.players[0], { ...snap.players[1], seat: snap.players[0].seat }] });
+  eq(dupSeat.players.length, 1, 'a duplicate seat is dropped');
+  eq(dupSeat.phase, PHASES.LOBBY, 'which leaves too few players to resume a game');
+  eq(bad({ players: [snap.players[0], { ...snap.players[1], id: snap.players[0].id }] }).players.length, 1, 'a duplicate id is dropped');
+  eq(bad({ players: [snap.players[0], { id: '', seat: WHITE }, snap.players[1]] }).players.length, 2,
+    'a malformed player entry is skipped without losing the good ones');
+  eq(bad({ plies: -4 }).plies, 0, 'negative plies fall back to zero');
+  eq(bad({ gamesPlayed: 1.5 }).gamesPlayed, 0, 'a fractional game count falls back to zero');
+  eq(bad({ turn: 'x' }).turn, BLACK, 'a bad turn falls back to black');
+  eq(bad({ startSeat: 'x' }).startSeat, BLACK, 'a bad startSeat falls back to black');
+  eq(bad({ winner: 'nobody' }).winner, null, 'an unknown winner is dropped');
+  eq(bad({ finalScore: { black: -1, white: 2, empty: 0 } }).finalScore, null, 'a negative score is dropped');
+  const named = bad({ players: [{ ...snap.players[0], name: 42, isBot: 'yes', connected: 'no' }, snap.players[1]] }).players[0];
+  eq(named.name, 'Player', 'a non-string name gets the default');
+  eq(named.isBot, false, 'a non-boolean isBot is false');
+  eq(named.connected, true, 'a non-boolean connected defaults to present');
+  eq(bad({ ownerId: 'ghost' }).ownerId, snap.players[0].id, 'an owner who is not seated falls back to the first human');
+  eq(bad({ ownerId: 12 }).ownerId, snap.players[0].id, 'a non-string owner falls back too');
+
+  // (4) A game cannot resume without both seats.
+  const onePlayer = bad({ players: [snap.players[0]] });
+  eq(onePlayer.phase, PHASES.LOBBY, 'PLAY with one player restores to the lobby');
+  eq(onePlayer.players.length, 1, 'the lone player stays seated, so the app can still resume the lobby');
+  eq(onePlayer.plies, 0, 'with no moves played');
+  eq(countDiscs(onePlayer.board).black + countDiscs(onePlayer.board).white, 4, 'on a fresh opening board');
+  eq(bad({ players: [] }).phase, PHASES.LOBBY, 'and with no players at all');
+
+  // (5) A finished game keeps its result.
+  const done = twoPlayerGame({
+    size: 6, turn: BLACK,
+    rows: ['......', '......', '..WB..', '......', '......', '......'],
+  });
+  done.playMove('p-black', cellAt(2, 1, 6));
+  eq(done.phase, PHASES.GAME_OVER, 'setup: the game is over');
+  const overSnap = rt(done);
+  const over = new GameEngine().restore(overSnap);
+  eq(over.phase, PHASES.GAME_OVER, 'GAME_OVER survives');
+  eq(over.winner, done.winner, 'the winner survives');
+  eq(JSON.stringify(over.finalScore), JSON.stringify(done.finalScore), 'the final score survives');
+  eq(JSON.stringify(over.serialize()), JSON.stringify(done.serialize()), 'and the whole finished game round-trips');
+}
+
 section('play again and back to lobby');
 {
   const engine = twoPlayerGame({
@@ -489,6 +648,68 @@ section('play again and back to lobby');
   eq(engine.phase, PHASES.LOBBY, 'in the lobby');
   ok(engine.setConfig({ boardSize: 10 }).ok, 'where the rules unlock again');
   eq(engine.size, 10, 'and the preview board resizes immediately');
+}
+
+section('absent players and the lobby');
+{
+  const setup = () => {
+    const e = new GameEngine();
+    e.addPlayer('host1', 'Host');
+    e.addPlayer('guest1', 'Guest');
+    e.startGame();
+    return e;
+  };
+
+  const e = setup();
+  e.removePlayer('guest1');
+  eq(e.players.length, 2, 'mid-game the dropped guest keeps their seat');
+  e.endGame();
+  const seatBefore = e.playerById('host1').seat;
+  const refusedAgain = e.playAgain();
+  ok(!refusedAgain.ok, 'play again is refused while the opponent is away');
+  ok(/Guest/.test(refusedAgain.error),
+    'and names who we are waiting for');
+  eq(e.playerById('host1').seat, seatBefore, 'a refused rematch does not swap colours');
+  eq(e.phase, PHASES.GAME_OVER, 'and stays on the results');
+
+  ok(e.backToLobby().ok, 'back to the lobby');
+  eq(e.players.length, 1, 'the absent guest is released');
+  ok(!e.startGame().ok, 'cannot start alone');
+  ok(e.addPlayer('newguest1', 'New').ok, 'a new guest can take the freed seat');
+  ok(e.startGame().ok, 'and the game starts');
+
+  const r = setup();
+  r.removePlayer('guest1');
+  r.endGame();
+  ok(r.addPlayer('guest1', 'Guest').ok, 'a reconnect with the same id');
+  ok(r.playAgain().ok, 'makes the rematch work again');
+
+  const h = setup();
+  h.endGame();
+  h.backToLobby();
+  h.removePlayer('guest1');
+  h.addPlayer('guest1', 'Guest');
+  h.players.find((p) => p.id === 'guest1').connected = false;
+  ok(!h.startGame().ok, 'startGame refused in the lobby when a seated player is away');
+  h.players.find((p) => p.id === 'guest1').connected = true;
+  ok(h.startGame().ok, 'and allowed once they say hello');
+
+  const o = setup();
+  o.removePlayer('host1');
+  o.endGame();
+  o.backToLobby();
+  eq(o.ownerId, 'guest1', 'ownership passes on if the owner was away');
+  eq(o.players.length, 1, 'only the present player remains');
+
+  const b = new GameEngine();
+  b.addPlayer('host1', 'Host');
+  b.addPlayer('bot1', 'Bot', { isBot: true });
+  b.startGame();
+  b.endGame();
+  ok(b.playAgain().ok, 'bots never count as away');
+  b.endGame();
+  b.backToLobby();
+  eq(b.players.length, 2, 'and survive the trip to the lobby');
 }
 
 // --- Rules -----------------------------------------------------------------
@@ -713,7 +934,12 @@ section('bot: move legality across levels, sizes and scoring');
   // without ever producing a move the generator would refuse. A small budget
   // keeps this quick while still driving the real iterative-deepening path —
   // a starved search must still return a legal move from a completed depth.
-  const GAMES = 120;
+  //
+  // The cost here is the clock, not the CPU: every move spends its whole 5ms,
+  // so time scales with games played. Fast mode plays one game per
+  // configuration instead of 20, which still covers every level, size and
+  // scoring mode.
+  const GAMES = pick(6, 120);
   for (const level of ['easy', 'medium', 'hard']) {
     let illegal = 0;
     let games = 0;
@@ -872,14 +1098,59 @@ section('bot: the search values corners');
   }
 }
 
+section('bot: ties are only ever between exact scores');
+{
+  // Alpha-beta returns only an upper bound for a root move that is refuted,
+  // and on a transposing game that bound often equals the best score. If the
+  // bot shuffles among "equal" scores it can pick such a move even though its
+  // true value is worse. Check the pick against the exact full-window values.
+  seed(7);
+  const cfg = { boardSize: 6, level: 'medium', deadline: Infinity };
+  const POSITIONS = pick(25, 150);
+  let checked = 0;
+  let bad = 0;
+  let worst = null;
+  let board = openingBoard(6);
+  let player = BLACK;
+  while (checked < POSITIONS) {
+    const legal = legalMoves(board, player, 6);
+    if (!legal.length) {
+      if (!hasLegalMove(board, opponent(player), 6)) { board = openingBoard(6); player = BLACK; continue; }
+      player = opponent(player);
+      continue;
+    }
+    if (legal.length > 1) {
+      const exact = rootScores(board, player, cfg);
+      const best = Math.max(...exact.values());
+      for (let k = 0; k < 3; k++) {
+        const cell = chooseMove(board, player, cfg);
+        const got = exact.get(cell);
+        if (got !== best) { bad++; worst = { got, best }; }
+      }
+      checked++;
+    }
+    // Advance on a random legal move so positions vary.
+    const mv = legal[randomBelow(legal.length)];
+    board = applyMove(board, mv, player, 6).board;
+    player = opponent(player);
+  }
+  ok(bad === 0, `medium never picks a move worse than the exact best (${bad} bad picks in ${checked} positions${worst ? `, e.g. ${worst.got} vs ${worst.best}` : ''})`);
+}
+
 section('bot: deeper levels play stronger');
 {
   // Full depth on the small board: hard reaches 6 plies where medium stops at
   // 3, so this measures the depth difference rather than the clock. Colours
   // alternate so neither level keeps the first-move advantage.
+  //
+  // This is the slowest section by far: hard searches six plies with no clock
+  // to cut it short. Fast mode plays fewer games with the floor kept at roughly
+  // the same fraction (about two thirds). The stream is seeded and each trial
+  // replays the same opening games, so the fast games are a prefix of the full
+  // ones — the floors were checked against that exact prefix, not hoped for.
   const trials = [
-    { strong: 'medium', weak: 'easy', n: 20, floor: 13 },
-    { strong: 'hard', weak: 'medium', n: 10, floor: 7 },
+    { strong: 'medium', weak: 'easy', n: pick(8, 20), floor: pick(5, 13) },
+    { strong: 'hard', weak: 'medium', n: pick(5, 10), floor: pick(3, 7) },
   ];
   for (const { strong, weak, n, floor } of trials) {
     seed(42);
@@ -914,15 +1185,24 @@ section('bot: the time box holds');
   ok(legalMoves(board, BLACK, 10).includes(cell), 'a search cut off almost immediately still returns a legal move');
 
   // Real clock, real budget: a full 10x10 midgame think must respect the cap.
+  //
+  // A whole game at the real budget is ~50s of pure waiting, so fast mode runs
+  // the same game on a sixth of the budget. The check is relative to whatever
+  // budget was used, so it still catches a box that fails open.
+  const budget = pick(SEARCH_BUDGET_MS / 6, SEARCH_BUDGET_MS);
   let worst = 0;
   seed(13);
-  const r = botGame({ size: 10, levels: { [BLACK]: 'hard', [WHITE]: 'hard' }, budgetMs: SEARCH_BUDGET_MS });
+  const r = botGame({ size: 10, levels: { [BLACK]: 'hard', [WHITE]: 'hard' }, budgetMs: budget });
   worst = r.worst;
   eq(r.illegal, 0, 'a full-budget 10x10 game stays legal throughout');
   // Generous ceiling: the check runs every 256 nodes, so the budget can be
   // overshot by whatever the node in flight costs. This is a guard against
   // the box failing open, not a benchmark.
-  ok(worst <= SEARCH_BUDGET_MS * 2, `worst think ${worst}ms stayed within twice the ${SEARCH_BUDGET_MS}ms budget`);
+  // The overshoot is roughly a constant (one node batch), not a fraction of
+  // the budget, so the shrunken fast-mode budget gets a fixed allowance rather
+  // than a doubling that a busy machine can tip over. Full mode is unchanged.
+  const ceiling = Math.max(budget * 2, budget + 300);
+  ok(worst <= ceiling, `worst think ${worst}ms stayed within ${ceiling}ms for a ${budget}ms budget`);
   console.log(`  10x10 hard, worst think ${worst}ms`);
 }
 
@@ -1034,6 +1314,103 @@ section('peer errors are classified and translated');
   }
   eq(describePeerError(null), 'Something went wrong with the connection.',
     'even a null error produces a sentence');
+}
+
+section('host connections survive a re-dial');
+{
+  // net.js reads globalThis.Peer lazily, so a tiny fake stands in for PeerJS.
+  class Emitter {
+    constructor() { this.h = {}; }
+    on(evt, fn) { (this.h[evt] ||= []).push(fn); }
+    emit(evt, ...args) { (this.h[evt] || []).slice().forEach((fn) => fn(...args)); }
+  }
+  class FakePeer extends Emitter {
+    constructor(id) { super(); this.id = id; this.destroyed = false; this.disconnected = false; }
+    destroy() { this.destroyed = true; }
+  }
+  class FakeConn extends Emitter {
+    constructor(peer) { super(); this.peer = peer; this.open = false; this.sent = []; this.closeCalls = 0; }
+    send(str) { this.sent.push(str); }
+    // Like the real thing, close() is slow: the test emits 'close' by hand,
+    // late, to model a WebRTC channel that takes its time to wind down.
+    close() { this.closeCalls++; this.open = false; }
+  }
+  const realPeer = globalThis.Peer;
+  globalThis.Peer = FakePeer;
+  try {
+    const frame = JSON.stringify({ type: 'ping' });
+    const setup = () => {
+      const log = { connect: [], data: [], disc: [], full: [] };
+      const host = createHost('ABCD', {
+        onConnect: (id) => log.connect.push(id),
+        onData: (id, m) => log.data.push([id, m.type]),
+        onDisconnect: (id) => log.disc.push(id),
+        onFull: (id) => log.full.push(id),
+      });
+      const dial = (id) => {
+        const c = new FakeConn(id);
+        host.peer.emit('connection', c);
+        c.open = true; c.emit('open');
+        return c;
+      };
+      return { host, log, dial };
+    };
+
+    // (a) the same guest re-dials; the old channel's late events are stale
+    {
+      const { host, log, dial } = setup();
+      const a = dial('g1');
+      a.emit('data', frame);
+      eq(log.data.length, 1, 'data flows on the first channel');
+      const b = dial('g1');
+      eq(a.closeCalls, 1, 'the superseded channel is closed');
+      eq(host.connections.size, 1, 'the re-dial replaces rather than adds');
+      a.emit('close');
+      a.emit('error');
+      eq(log.disc.length, 0, 'the old channel closing late does not report a disconnect');
+      ok(host.connections.has('g1'), 'the replacement is still registered');
+      host.broadcast({ type: 'state' });
+      eq(b.sent.length, 1, 'broadcast still reaches the new channel');
+      eq(a.sent.length, 0, 'and not the old one');
+      a.emit('data', frame);
+      eq(log.data.length, 1, 'frames from the superseded channel are ignored');
+      b.emit('data', frame);
+      eq(log.data.length, 2, 'frames from the current channel are delivered');
+      // (b) a normal close of the current channel still reports exactly once
+      b.emit('close');
+      b.emit('error');
+      eq(log.disc.length, 1, 'closing the current channel fires onDisconnect once');
+      eq(log.disc[0], 'g1', 'with the right id');
+      eq(host.connections.size, 0, 'and frees the slot');
+    }
+
+    // a replacement is not refused at the connection cap
+    {
+      const { host, log, dial } = setup();
+      for (let i = 0; i < MAX_CONNECTIONS; i++) dial('g' + i);
+      eq(host.connections.size, MAX_CONNECTIONS, 'host is at the cap');
+      const again = dial('g0');
+      eq(log.full.length, 0, 'a re-dial at the cap is not turned away');
+      eq(host.connections.get('g0').conn, again, 'it takes over the seat');
+      dial('stranger');
+      eq(log.full.length, 1, 'a genuinely new peer at the cap is still refused');
+    }
+
+    // (c) dropConnection reports once, and the dropped channel's late close is silent
+    {
+      const { host, log, dial } = setup();
+      const a = dial('g1');
+      host.dropConnection('g1');
+      eq(log.disc.length, 1, 'dropConnection fires onDisconnect once');
+      eq(a.closeCalls, 1, 'and closes the channel');
+      a.emit('close');
+      eq(log.disc.length, 1, 'the late close of a dropped channel does not fire it again');
+      host.dropConnection('g1');
+      eq(log.disc.length, 1, 'dropping an absent connection is a no-op');
+    }
+  } finally {
+    globalThis.Peer = realPeer;
+  }
 }
 
 section('the server seam is present and unwired');
@@ -1360,7 +1737,9 @@ section('a reload lands back in the same game');
 
 section('random full games');
 {
-  const GAMES = 300;
+  // Fast mode keeps every board size and both scoring modes, so each rule path
+  // is still exercised; it only samples fewer random games from each.
+  const GAMES = pick(40, 300);
   for (const size of BOARD_SIZES) {
     for (const antiOthello of [false, true]) {
       seed(size * 1000 + (antiOthello ? 1 : 0));
@@ -1536,6 +1915,16 @@ section('packaging: the page, the manifest and the worker agree');
   // Best-effort only. In SHELL it would be a CDN hiccup failing the whole
   // install, and hotseat and bot mode do not need the file at all.
   ok(!shell.has(`https://${pinned[0]}`), 'but PeerJS is not in SHELL');
+
+  // The tag itself: SRI needs a CORS fetch (crossorigin), and defer keeps a
+  // slow CDN from blocking parsing while main.js (a module, so also deferred)
+  // still runs after it in document order.
+  const peerTag = html.match(/<script\b[^>]*unpkg\.com\/peerjs@[^>]*>/);
+  ok(!!peerTag, 'the PeerJS script tag is found');
+  ok(/\bintegrity="sha384-[A-Za-z0-9+/]{64}"/.test(peerTag[0]), 'PeerJS carries a sha384 integrity hash');
+  ok(/\bcrossorigin="anonymous"/.test(peerTag[0]), 'PeerJS is fetched in CORS mode, as SRI and the worker cache need');
+  ok(/\bdefer\b/.test(peerTag[0]), 'PeerJS is deferred');
+  ok(html.indexOf(peerTag[0]) < html.indexOf('src="./js/main.js"'), 'and precedes main.js in document order');
 }
 
 section('packaging: the felt does not evict the squares it sits behind');
@@ -1578,5 +1967,6 @@ section('packaging: the felt does not evict the squares it sits behind');
 
 // --- Result ----------------------------------------------------------------
 
+endSection();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
