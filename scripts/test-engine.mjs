@@ -1198,7 +1198,11 @@ section('bot: the time box holds');
   // Generous ceiling: the check runs every 256 nodes, so the budget can be
   // overshot by whatever the node in flight costs. This is a guard against
   // the box failing open, not a benchmark.
-  ok(worst <= budget * 2, `worst think ${worst}ms stayed within twice the ${budget}ms budget`);
+  // The overshoot is roughly a constant (one node batch), not a fraction of
+  // the budget, so the shrunken fast-mode budget gets a fixed allowance rather
+  // than a doubling that a busy machine can tip over. Full mode is unchanged.
+  const ceiling = Math.max(budget * 2, budget + 300);
+  ok(worst <= ceiling, `worst think ${worst}ms stayed within ${ceiling}ms for a ${budget}ms budget`);
   console.log(`  10x10 hard, worst think ${worst}ms`);
 }
 
