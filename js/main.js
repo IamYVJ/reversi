@@ -389,8 +389,13 @@ function onHostMessage(msg) {
 
     case 'refused': {
       const why = validNameField(msg.reason);
+      // Being refused leaves nothing to resume: no link, no state, and a saved
+      // session that would make a reload try the same door again. goHome()
+      // resets all of that (it is safe to hang up from inside this handler,
+      // since nothing below touches the link). It also clears app.notice, so
+      // the refusal text has to be set afterwards.
+      goHome();
       app.notice = why === 'full' ? 'That game is already full.' : (why || 'The host turned you away.');
-      dropLink();
       draw();
       return;
     }
